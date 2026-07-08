@@ -7,10 +7,9 @@ Each sweep runs n_seeds trials per value and reports:
     acc(w)   -- fraction of seeds where argmax(w) correctly identified the
                 true major agent
 
-Writes three CSV files: comparison_G.csv, comparison_N.csv, comparison_lambda.csv
+Writes three plain-text tables: comparison_G.txt, comparison_N.txt, comparison_lambda.txt
 """
 
-import csv
 import numpy as np
 from mfg import MFG, MFG_config
 from solver import make_example, detect_major_G_closedform
@@ -25,7 +24,7 @@ N_BASE        = 512
 G_TRUE_BASE   = 0.5
 LAM_BASE      = 50.0
 
-N_SEEDS = 10   # trials per swept value; bump up for tighter mean/RMSE/acc estimates
+N_SEEDS = 50   # trials per swept value; bump up for tighter mean/RMSE/acc estimates
 
 N_EM_ITERS      = 100
 N_INNER_E_STEPS = 20
@@ -50,21 +49,24 @@ def summarize(G_hats, correct_flags, G_true):
     }
 
 
-def write_csv(path, key_name, rows):
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=[key_name, "mean_G_hat", "rmse", "acc_w", "n_seeds"])
-        writer.writeheader()
-        for r in rows:
-            writer.writerow(r)
-    print(f"wrote {path}")
+def format_table(key_name, rows):
+    lines = [f"{key_name:>10} | {'mean G*':>8} | {'RMSE':>8} | {'acc(w)':>8} | {'n_seeds':>7}"]
+    lines.append("-" * 52)
+    for r in rows:
+        lines.append(f"{r[key_name]:>10.3g} | {r['mean_G_hat']:>8.4f} | {r['rmse']:>8.4f} | "
+                      f"{r['acc_w']:>8.2%} | {r['n_seeds']:>7}")
+    return "\n".join(lines)
 
 
 def print_table(key_name, rows):
-    print(f"{key_name:>10} | {'mean G*':>8} | {'RMSE':>8} | {'acc(w)':>8}")
-    print("-" * 44)
-    for r in rows:
-        print(f"{r[key_name]:>10.3g} | {r['mean_G_hat']:>8.4f} | {r['rmse']:>8.4f} | {r['acc_w']:>8.2%}")
+    print(format_table(key_name, rows))
     print()
+
+
+def write_table(path, key_name, rows):
+    with open(path, "w") as f:
+        f.write(format_table(key_name, rows) + "\n")
+    print(f"wrote {path}")
 
 
 # -----------------------------------------------------------------------------
@@ -149,14 +151,14 @@ if __name__ == "__main__":
     print("=== Sweep 1/3: G_true ===")
     rows_G = sweep_G([0.1, 0.3, 0.5, 0.7, 0.9])
     print_table("G_true", rows_G)
-    write_csv("comparison_G.csv", "G_true", rows_G)
+    write_table("comparison_G.txt", "G_true", rows_G)
 
     print("=== Sweep 2/3: N ===")
     rows_N = sweep_N([64, 128, 256, 512, 1024])
     print_table("N", rows_N)
-    write_csv("comparison_N.csv", "N", rows_N)
+    write_table("comparison_N.txt", "N", rows_N)
 
     print("=== Sweep 3/3: lam_entropy ===")
     rows_lambda = sweep_lambda([0.0, 5.0, 20.0, 50.0, 100.0, 500.0])
     print_table("lam_entropy", rows_lambda)
-    write_csv("comparison_lambda.csv", "lam_entropy", rows_lambda)
+    write_table("comparison_lambda.txt", "lam_entropy", rows_lambda)
