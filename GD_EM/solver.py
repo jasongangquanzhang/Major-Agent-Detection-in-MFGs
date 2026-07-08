@@ -70,7 +70,7 @@ def detect_major_G(mfg:MFG, X,true_major_idx:int,
                          lr_E=0.05, lr_G=0.05, lam_entropy=0.0,
                          leave_one_out=True, temp_anneal=False,
                          init_theta=None, init_G=None, verbose=False,
-                         fix_phi0=True):
+                         fix_phi0=False):
     """
     mfg         : MFG instance with solve_ODE() already called.
     X           : (N+1, Ndt+1) observed agent trajectories. Rows = agents.
@@ -79,19 +79,21 @@ def detect_major_G(mfg:MFG, X,true_major_idx:int,
     n_inner_E_steps : number of Adam steps on theta per E-step (G held fixed).
     n_inner_M_steps : number of Adam steps on G per M-step (w held fixed);
                       phi_0(G) is re-solved, differentiably, every substep
-                      (only when fix_phi0=False -- see below).
-    fix_phi0    : if True (default), phi_0(t) is treated as a KNOWN, FIXED
+                      (default -- see fix_phi0 below).
+    fix_phi0    : if False (default), phi_0(G) is re-solved differentiably every E-step
+                  (detached snapshot) and every M-step substep (tracked), so
+                  ell_major is genuinely G-coupled through the major bank's
+                  own Riccati ODE, not just ell_minor through the market mix --
+                  the fully self-consistent estimator.
+                  If True, phi_0(t) is instead treated as a KNOWN, FIXED
                   coefficient -- taken once from mfg.solve_ODE() (i.e. at
                   mfg's own G) and never re-solved as G is estimated. ell_major
-                  is then G-free again, exactly like the very first version of
-                  this file, and only ell_minor carries the direct G-coupling
+                  is then G-free, exactly like the very first version of this
+                  file, and only ell_minor carries the direct G-coupling
                   through the market mix. Gradient ascent on G is still used
                   for the M-step (not the closed-form LS solution), so this is
                   a clean ablation against fix_phi0=False: same optimizer,
                   only difference is whether phi_0 tracks G or not.
-                  If False, phi_0(G) is re-solved differentiably every E-step
-                  (detached snapshot) and every M-step substep (tracked), per
-                  the discussion of the fully self-consistent estimator.
     returns     : (major_prob (N+1,) tensor, G (scalar tensor), history list of J values)
     """
     # mfg.solve_ODE()
@@ -161,6 +163,7 @@ def detect_major_G(mfg:MFG, X,true_major_idx:int,
     history_E = []      # E-step J trace (one point per theta gradient step)
     history_M = []    # M-step J trace (one point per G gradient step)
     recent_G = []     # rolling window of G, for the early-stop check below
+    major_snapshots = []   # (step, x0_hat_full) every 20 steps, for the trajectory-dynamics plot
     n_steps = n_em_iters * n_inner_E_steps
     step = 0
 
@@ -191,6 +194,7 @@ def detect_major_G(mfg:MFG, X,true_major_idx:int,
             opt_theta.zero_grad(); loss.backward(); opt_theta.step()
             history_E.append(J.item())
             
+
         # ============================= M-step ================================
         # freeze responsibilities w, update G by gradient ascent. phi_0(G) is
         # re-solved DIFFERENTIABLY every substep, so the backward pass carries
@@ -217,7 +221,7 @@ def detect_major_G(mfg:MFG, X,true_major_idx:int,
             torch.nn.utils.clip_grad_norm_([g_raw], max_norm=5.0)
             opt_G.step()
             history_M.append(J.item())
-
+        
         # --- early stop: w has essentially committed to one agent AND G has
         # stopped moving -- no point burning more EM iterations past this.
         recent_G.append(torch.sigmoid(g_raw).item())
@@ -231,21 +235,10 @@ def detect_major_G(mfg:MFG, X,true_major_idx:int,
         if verbose:
             am = torch.softmax(theta, dim=0).argmax().item()
             print(f"  EM iter {em_iter:3d}  J={history_E[-1]:.4e}  G={torch.sigmoid(g_raw).item():.4f}  argmax={am}")
-            if step % 10 == 0:
-                with torch.no_grad():
-                    x0_hat_full = (w.unsqueeze(1) * X).sum(dim=0)                     # (Ndt+1,)
-
-                t_axis = np.arange(X.shape[1])
-                fig, ax = plt.subplots(figsize=(10, 5))
-                ax.plot(t_axis, true_major.numpy(), 'o-', label=f'True major (agent {true_major_idx})', linewidth=2, markersize=3)
-                ax.plot(t_axis, x0_hat_full.numpy(), 's--', label='Estimated soft major (x0_hat)', linewidth=2, markersize=3)
-                ax.set_xlabel('Time step'); ax.set_ylabel('State value')
-                ax.set_title(f'Major agent: true vs estimated  (argmax={am}, max(w)={w.max().item():.3f}, G={G.item():.4f})')
-                ax.legend(); ax.grid(True, alpha=0.3)
-
-                plt.tight_layout()
-                plt.savefig(f'debug_iter_{em_iter:03d}.png', dpi=150)
-                plt.close(fig)
+        if step % 10 == 0:
+            with torch.no_grad():
+                x0_hat_full = (w.unsqueeze(1) * X).sum(dim=0)                     # (Ndt+1,)
+            major_snapshots.append((step, x0_hat_full.numpy()))
         step += 1
     with torch.no_grad():
         major_prob = torch.softmax(theta, dim=0)
@@ -265,7 +258,39 @@ def detect_major_G(mfg:MFG, X,true_major_idx:int,
         plt.close(fig)
         print("  saved loss plot to loss_detect_major_G.png")
 
-    return major_prob, torch.sigmoid(g_raw).detach()
+        # --- one combined plot: how x0_hat evolved toward the true major -----
+        if major_snapshots:
+            with torch.no_grad():
+                x0_hat_terminal = (major_prob.unsqueeze(1) * X).sum(dim=0).numpy()
+
+            t_axis = np.arange(X.shape[1])
+            fig, ax = plt.subplots(figsize=(11, 6))
+
+            cmap = plt.cm.viridis
+            n_snap = len(major_snapshots)
+            for i, (snap_step, x0_hat_snap) in enumerate(major_snapshots):
+                color = cmap(i / max(n_snap - 1, 1))
+                ax.plot(t_axis, x0_hat_snap, color=color, alpha=0.6, linewidth=1)
+
+            ax.plot(t_axis, true_major.numpy(), color='black', linewidth=2.5,
+                     label=f'True major (agent {true_major_idx})')
+            ax.plot(t_axis, x0_hat_terminal, color='red', linewidth=2, linestyle='--',
+                     label='Terminal estimate (x0_hat)')
+
+            sm = plt.cm.ScalarMappable(cmap=cmap,
+                                        norm=plt.Normalize(vmin=major_snapshots[0][0], vmax=major_snapshots[-1][0]))
+            sm.set_array([])
+            fig.colorbar(sm, ax=ax, label='training step')
+
+            ax.set_xlabel('Time step'); ax.set_ylabel('State value')
+            ax.set_title('Major agent estimate: dynamics over training vs true')
+            ax.legend(loc='upper left'); ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig('major_trajectory_dynamics.png', dpi=150)
+            plt.close(fig)
+            print("  saved major trajectory dynamics plot to major_trajectory_dynamics.png")
+
+    return major_prob, torch.sigmoid(g_raw).detach(),step
 
 
 # ----------------------------------------------------------------------------
