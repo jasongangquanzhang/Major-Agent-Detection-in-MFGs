@@ -33,19 +33,19 @@ The model follows Chang, Firoozi & Benatia (2025) and describes an interbank mar
 
 **Major bank** — log-reserve $x^0_t$:
 
-$$dx^0_t = a_0\!\left(\bar{x}_t - x^0_t\right)dt + u^0_t\,dt + \sigma_0\,dW^0_t$$
+$$dx^0_t = a_0\left(\bar{x}_t - x^0_t\right)dt + u^0_t dt + \sigma_0 dW^0_t$$
 
 The major bank mean-reverts to the average minor-bank reserve $\bar{x}_t$ at rate $a_0 = aG$, where $G$ is its relative market size and $F = 1 - G$ is the collective size of the minor banks.
 
 **Representative minor bank** — log-reserve $x^i_t$:
 
-$$dx^i_t = a\!\left(F\bar{x}_t + Gx^0_t - x^i_t\right)dt + u^i_t\,dt + \sigma\,dW^i_t$$
+$$dx^i_t = a\left(F\bar{x}_t + Gx^0_t - x^i_t\right)dt + u^i_t dt + \sigma dW^i_t$$
 
 Each minor bank mean-reverts to the **market state** $m_t = F\bar{x}_t + G x^0_t$, a weighted average of the mean field and the major bank's reserve.
 
 **Mean-field equation** (limiting dynamics of $\bar{x}_t$):
 
-$$d\bar{x}_t = \left(a + q - \phi_t\right)\!\left[(F-1)\bar{x}_t + Gx^0_t\right]dt$$
+$$d\bar{x}_t = \left(a + q - \phi_t\right)\left[(F-1)\bar{x}_t + Gx^0_t\right]dt$$
 
 where $\phi_t$ is the solution of the minor bank's Riccati ODE (see below).
 
@@ -55,11 +55,11 @@ The equilibrium strategies are derived via convex/variational analysis. Each ban
 
 **Major bank:**
 
-$$u^{0,*}_t = \left(q_0 - \phi^0_t\right)\!\left(\bar{x}_t - x^0_t\right)$$
+$$u^{0,*}_t = \left(q_0 - \phi^0_t\right)\left(\bar{x}_t - x^0_t\right)$$
 
 **Minor bank:**
 
-$$u^{i,*}_t = \left(q - \phi_t\right)\!\left(F\bar{x}_t + Gx^0_t - x^i_t\right)$$
+$$u^{i,*}_t = \left(q - \phi_t\right)\left(F\bar{x}_t + Gx^0_t - x^i_t\right)$$
 
 ### Riccati ODEs (solved backward from terminal conditions)
 
@@ -69,7 +69,7 @@ $$\dot{\phi}_t = 2(a+q)\phi_t - \phi_t^2 + \varepsilon - q^2$$
 
 **Major bank** — $\phi^0_T = -c_0$:
 
-$$\dot{\phi}^0_t = 2\!\left[(a_0 + q_0) + G(a + q - \phi_t)\right]\phi^0_t - (\phi^0_t)^2 + \varepsilon_0 - q_0^2$$
+$$\dot{\phi}^0_t = 2\left[(a_0 + q_0) + G(a + q - \phi_t)\right]\phi^0_t - (\phi^0_t)^2 + \varepsilon_0 - q_0^2$$
 
 These ODEs are solved numerically via backward Euler in [`single_major_template/mfg.py`](single_major_template/mfg.py). The effective mean-reversion rates after optimal control are $a + q - \phi_t$ (minor) and $a_0 + q_0 - \phi^0_t$ (major).
 
@@ -85,14 +85,14 @@ The method is implemented in [`single_major_template/detect_major.py`](single_ma
 
 For each agent $i$ and each time step, the one-step transition log-likelihoods are:
 
-- **Major score** $\ell^{\text{maj}}_i(t)$: agent $i$ follows the major SDE — Gaussian transition with mean $x_i(t) + (a_0 + q_0 - \phi^0_t)(\bar{x}_t - x_i(t))\,\Delta t$ and noise $\sigma_0\sqrt{\Delta t}$.
-- **Minor score** $\ell^{\text{min}}_i(t)$: agent $i$ follows the minor SDE — Gaussian transition with mean $x_i(t) + (a + q - \phi_t)(m_t - x_i(t))\,\Delta t$ and noise $\sigma\sqrt{\Delta t}$, where $m_t = F\bar{x}_t + G x^0_t$ is the market state.
+- **Major score** $\ell^{\text{maj}}_i(t)$: agent $i$ follows the major SDE — Gaussian transition with mean $x_i(t) + (a_0 + q_0 - \phi^0_t)(\bar{x}_t - x_i(t)) \Delta t$ and noise $\sigma_0\sqrt{\Delta t}$.
+- **Minor score** $\ell^{\text{min}}_i(t)$: agent $i$ follows the minor SDE — Gaussian transition with mean $x_i(t) + (a + q - \phi_t)(m_t - x_i(t)) \Delta t$ and noise $\sigma\sqrt{\Delta t}$, where $m_t = F\bar{x}_t + G x^0_t$ is the market state.
 
 ### Softmax Relaxation (primary method)
 
 Because the major agent's trajectory $x^0_t$ enters the market state $m_t$, the minor scores are coupled to the unknown identity. We introduce a soft assignment $w = \text{softmax}(\theta) \in \Delta^N$ (one weight per agent) and construct a **soft market state**:
 
-$$\hat{x}^0_t(w) = \sum_i w_i\, x_i(t), \qquad \hat{m}_t(w) = F\bar{x}_t + G\hat{x}^0_t(w)$$
+$$\hat{x}^0_t(w) = \sum_i w_i  x_i(t), \qquad \hat{m}_t(w) = F\bar{x}_t + G\hat{x}^0_t(w)$$
 
 The objective is then maximized by gradient ascent on $\theta$:
 
@@ -113,7 +113,7 @@ Two observation regimes are supported:
 
 A closed-form baseline scores each agent $i$ by the log-likelihood ratio of being major vs. minor, using $\bar{x}_t$ for the major reference and $(F+G)\bar{x}_t$ as a $w$-free market proxy:
 
-$$\text{gap}_i = L^{\text{maj}}_i - L^{\text{min}}_i, \qquad \hat{i} = \arg\max_i\, \text{gap}_i$$
+$$\text{gap}_i = L^{\text{maj}}_i - L^{\text{min}}_i, \qquad \hat{i} = \arg\max_i  \text{gap}_i$$
 
 ---
 
