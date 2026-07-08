@@ -24,7 +24,7 @@ N_BASE        = 256
 G_TRUE_BASE   = 0.5
 LAM_BASE      = 50.0
 
-N_SEEDS = 10   # trials per swept value; bump up for tighter mean/RMSE/acc estimates
+N_SEEDS = 50   # trials per swept value; bump up for tighter mean/RMSE/acc estimates
 
 N_EM_ITERS      = 100
 N_INNER_E_STEPS = 5
@@ -154,17 +154,17 @@ def sweep_lambda(lam_values, n_seeds=N_SEEDS):
 
 
 if __name__ == "__main__":
-    # print("=== Sweep 1/3: G_true ===")
-    # rows_G = sweep_G([0.1, 0.3, 0.5, 0.7, 0.9])
-    # print_table("G_true", rows_G)
-    # write_table("comparison_G.txt", "G_true", rows_G)
+    print("=== Sweep 1/3: G_true ===")
+    rows_G = sweep_G([0.1, 0.3, 0.5, 0.7, 0.9])
+    print_table("G_true", rows_G)
+    write_table("comparison_G.txt", "G_true", rows_G)
 
     print("=== Sweep 2/3: N ===")
     rows_N = sweep_N([64, 128, 256, 512, 1024])
     print_table("N", rows_N)
     write_table("comparison_N.txt", "N", rows_N)
 
-    # print("=== Sweep 3/3: lam_entropy ===")
-    # rows_lambda = sweep_lambda([0.0, 5.0, 20.0, 50.0, 100.0, 200])
-    # print_table("lam_entropy", rows_lambda)
-    # write_table("comparison_lambda.txt", "lam_entropy", rows_lambda)
+    print("=== Sweep 3/3: lam_entropy ===")
+    rows_lambda = sweep_lambda([0.0, 5.0, 20.0, 50.0, 100.0, 200])
+    print_table("lam_entropy", rows_lambda)
+    write_table("comparison_lambda.txt", "lam_entropy", rows_lambda)
