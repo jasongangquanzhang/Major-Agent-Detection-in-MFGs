@@ -19,7 +19,8 @@ ell_minor_i(t): log N( x_i(t+1) ; revert-to-MARKET(w) with minor rate, sigma^2 d
 import numpy as np
 import torch
 import torch.distributions as dist
-from single_major_template.mfg import MFG, MFG_config
+import matplotlib.pyplot as plt
+from mfg import MFG, MFG_config
 
 
 # ----------------------------------------------------------------------------
@@ -28,7 +29,8 @@ from single_major_template.mfg import MFG, MFG_config
 def detect_major_relaxed(mfg:MFG, X, x_bar_obs=None,
                          n_steps=1000, lr=0.05,
                          leave_one_out=True, temp_anneal=False,
-                         init_theta=None, verbose=False):
+                         init_theta=None, verbose=False,
+                         true_major_idx=None):
     """
     mfg         : MFG instance with solve_ODE() already called.
     X           : (N+1, Ndt+1) observed agent trajectories. Rows = agents.
@@ -37,6 +39,12 @@ def detect_major_relaxed(mfg:MFG, X, x_bar_obs=None,
                   If None, the mean field is estimated inside the loop as
                   x_bar_hat(w) = (1/N) * sum_i (1 - w_i) * x_i(t),
                   making Lmaj w-coupled (no precomputation possible).
+    true_major_idx : DEBUG ONLY -- index of the actual major agent in X (known
+                  because this is synthetic data from make_example). Not used
+                  by the estimator itself; only used, when verbose=True, to
+                  save a 'debug_step_NNNN.png' plot every 10 steps overlaying
+                  the true major trajectory and true (or data-only-estimated)
+                  mean field against the model's current soft estimates.
     returns     : (major_prob (N+1,) tensor, history list of J values)
     """
     dt = mfg.dt
@@ -123,6 +131,39 @@ def detect_major_relaxed(mfg:MFG, X, x_bar_obs=None,
             am = torch.softmax(theta, dim=0).argmax().item()
             print(f"  step {step:4d}  J={J.item():.4e}  argmax={am}")
 
+            if true_major_idx is not None:
+                with torch.no_grad():
+                    w_now = w.detach()
+                    x0_hat_full = (w_now.unsqueeze(1) * X).sum(dim=0)                     # (Ndt+1,)
+                    xbar_hat_full = ((1 - w_now).unsqueeze(1) * X).sum(dim=0) / N          # (Ndt+1,)
+                    true_major = X[true_major_idx]
+                    # "true" mean field: use x_bar_obs if given (Tier 2), else fall back
+                    # to the empirical average of the REAL minors (data-only, works in
+                    # Tier 3 too since it only needs true_major_idx, not x_bar_obs).
+                    true_xbar = (np.asarray(x_bar_obs) if x_bar_obs is not None
+                                 else ((X.sum(dim=0) - true_major) / N).numpy())
+
+                t_axis = np.arange(X.shape[1])
+                fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+
+                ax = axes[0]
+                ax.plot(t_axis, true_xbar, 'o-', label='True mean field (xbar)', linewidth=2, markersize=3)
+                ax.plot(t_axis, xbar_hat_full.numpy(), 's--', label='Estimated mean field (xbar_hat)', linewidth=2, markersize=3)
+                ax.set_ylabel('State value')
+                ax.set_title(f'Mean field: true vs estimated  (step {step})')
+                ax.legend(); ax.grid(True, alpha=0.3)
+
+                ax = axes[1]
+                ax.plot(t_axis, true_major.numpy(), 'o-', label=f'True major (agent {true_major_idx})', linewidth=2, markersize=3)
+                ax.plot(t_axis, x0_hat_full.numpy(), 's--', label='Estimated soft major (x0_hat)', linewidth=2, markersize=3)
+                ax.set_xlabel('Time step'); ax.set_ylabel('State value')
+                ax.set_title(f'Major agent: true vs estimated  (argmax={am}, max(w)={w_now.max().item():.3f})')
+                ax.legend(); ax.grid(True, alpha=0.3)
+
+                plt.tight_layout()
+                plt.savefig(f'debug_step_{step:04d}.png', dpi=150)
+                plt.close(fig)
+
     with torch.no_grad():
         major_prob = torch.softmax(theta, dim=0)
     return major_prob, history
@@ -193,13 +234,13 @@ if __name__ == "__main__":
     X, x_bar_obs, true_idx = make_example(mfg, N, seed=0)
 
     print("=== Relaxation (Tier 2, observed mean field) ===")
-    prob, hist = detect_major_relaxed(mfg, X, x_bar_obs, verbose=True)
+    prob, hist = detect_major_relaxed(mfg, X, x_bar_obs, verbose=True, true_major_idx=true_idx)
     pred = int(prob.argmax().item())
     print(f"predicted={pred}  true={true_idx}  correct={pred==true_idx}")
     print("top-3 prob:", np.round(np.sort(prob.numpy())[::-1][:3], 3))
 
     print("\n=== Relaxation (Tier 3, mean field unobserved -- estimated from X) ===")
-    prob3, hist3 = detect_major_relaxed(mfg, X, x_bar_obs=None, verbose=True)
+    prob3, hist3 = detect_major_relaxed(mfg, X, x_bar_obs=None, verbose=True, true_major_idx=true_idx)
     pred3 = int(prob3.argmax().item())
     print(f"predicted={pred3}  true={true_idx}  correct={pred3==true_idx}")
     print("top-3 prob:", np.round(np.sort(prob3.numpy())[::-1][:3], 3))
