@@ -55,7 +55,7 @@ T, NDT   = 1, 512
 N_BASE   = 256
 
 N_SEEDS         = 50
-N_EM_ITERS      = 100
+N_EM_ITERS      = 200
 N_INNER_E_STEPS = 5
 N_INNER_M_STEPS = 5
 LAM_ENTROPY     = 110.0   # normalized entropy penalty; validated good at N=256
@@ -67,6 +67,8 @@ STAGES = [
     (2, "G_a_a0",           ['G', 'a', 'a_0']),
     (3, "G_a_a0_q_q0",      ['G', 'a', 'a_0', 'q', 'q_0']),
     (4, "G_a_a0_q_q0_c_c0", ['G', 'a', 'a_0', 'q', 'q_0', 'c', 'c_0']),
+    (5, "G_a",              ['G', 'a']),
+    (6, "G_a_q",            ['G', 'a','q']),
 ]
 
 # cross product: (config_id, stage_idx, stage_name, unknown, G_true),
