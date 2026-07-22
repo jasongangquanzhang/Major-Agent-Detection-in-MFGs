@@ -280,7 +280,7 @@ class MajorAgentEstimator:
         step = 0
 
         for em_iter in range(n_em_iters + 1):
-            tau = 1.0 if not self.temp_anneal else max(0.3, 1.0 - step / n_steps)
+            tau = 1.0 if not self.temp_anneal else max(0.3, 1.2 - step / n_steps)
 
             # ============================= E-step ============================
             # freeze all current param estimates (detached), ascend theta only.
@@ -431,6 +431,117 @@ class MajorAgentEstimator:
         ax.legend(loc='upper left'); ax.grid(True, alpha=0.3)
         plt.tight_layout(); plt.savefig(path, dpi=150); plt.close(fig)
         print(f"  saved major trajectory dynamics plot to {path}")
+
+
+# ----------------------------------------------------------------------------
+# TEMPORARY / experimental: hardcoded to unknown={'G','a','q'}, testing
+# whether reparametrizing the M-step to (a+q, q) instead of (a, q) directly
+# fixes the ridge-drift problem found in that case. Does NOT touch
+# MajorAgentEstimator or PARAM_SPECS -- self-contained, reuses the class's
+# private _riccati/_loglik_* methods via a throwaway unknown=['G','a','q']
+# instance (needed so phi/phi_0 actually re-solve as functions of the
+# current a,q; they're never read from est.raw here, a and q are tracked as
+# a separate (a_plus_q, q) pair of raw tensors instead).
+# ----------------------------------------------------------------------------
+def fit_G_a_plus_q(mfg: MFG, X, true_major_idx=None, n_em_iters=100,
+                    n_inner_E_steps=5, n_inner_M_steps=5, lr_E=0.05, lr_M=0.05,
+                    lam_entropy=0.0, leave_one_out=True, verbose=False):
+    """
+    Returns (major_prob, fitted_dict, n_steps). fitted_dict has keys
+    'G', 'a_plus_q', 'q', 'a' (a is derived: a = a_plus_q - q).
+    """
+    est = MajorAgentEstimator(mfg, unknown=['G', 'a', 'q'], leave_one_out=leave_one_out)
+    dt, Ndt = mfg.dt, mfg.Ndt
+    X = torch.as_tensor(np.asarray(X), dtype=torch.float64)
+    Np1, _ = X.shape
+    N = Np1 - 1
+
+    sig_M = mfg.sigma_0 * dt ** 0.5
+    sig_m = mfg.sigma * dt ** 0.5
+    xt, xtp1 = X[:, :-1], X[:, 1:]
+
+    theta = torch.zeros(Np1, dtype=torch.float64, requires_grad=True)
+    opt_theta = torch.optim.Adam([theta], lr=lr_E)
+
+    g_raw = torch.tensor(np.random.uniform(-1, 1), dtype=torch.float64, requires_grad=True)
+    s_raw = torch.tensor(np.random.uniform(-1, 1), dtype=torch.float64, requires_grad=True)  # a+q
+    q_raw = torch.tensor(np.random.uniform(-1, 1), dtype=torch.float64, requires_grad=True)  # q
+    opt_M = torch.optim.Adam([g_raw, s_raw, q_raw], lr=lr_M)
+
+    G_spec = PARAM_SPECS['G']
+    S_spec = _Softplus()  # a+q > 0, same reasoning as a alone previously
+
+    def current_params(detach):
+        g_, s_, q_ = (t.detach() if detach else t for t in (g_raw, s_raw, q_raw))
+        G = G_spec.to_value(g_)
+        s = S_spec.to_value(s_)
+        a = s - q_
+        return {'G': G, 'a': a, 'a_0': mfg.a_0, 'q': q_, 'q_0': mfg.q_0,
+                'epslon': mfg.epslon, 'epslon_0': mfg.epslon_0, 'c': mfg.c, 'c_0': mfg.c_0}, s, q_
+
+    history_E, history_M, recent = [], [], []
+    step = 0
+
+    for em_iter in range(n_em_iters + 1):
+        p_frozen, _, _ = current_params(detach=True)
+        phi_minor_f, phi_major_f = est._riccati(p_frozen, track_grad=False)
+
+        for _ in range(n_inner_E_steps):
+            w = torch.softmax(theta, dim=0)
+            wt = w.unsqueeze(1)
+            x0_hat = (wt * xt).sum(dim=0)
+            xbar = ((1 - w).unsqueeze(1) * xt).sum(dim=0) / N
+            Lmaj = est._loglik_major(p_frozen, phi_major_f, xbar, xt, xtp1, dt, sig_M)
+            Lmin = est._loglik_minor(p_frozen, phi_minor_f, xbar, x0_hat, xt, xtp1, wt, dt, sig_m)
+            J = (w * Lmaj + (1 - w) * Lmin).sum()
+            H_w = -(w * torch.log(w + 1e-12)).sum() / np.log(Np1)
+            loss = -(J - lam_entropy * H_w)
+            opt_theta.zero_grad(); loss.backward(); opt_theta.step()
+            history_E.append(J.item())
+
+        with torch.no_grad():
+            w_frozen = torch.softmax(theta, dim=0)
+            wt_frozen = w_frozen.unsqueeze(1)
+            x0_hat_frozen = (wt_frozen * xt).sum(dim=0)
+            xbar_frozen = ((1 - w_frozen).unsqueeze(1) * xt).sum(dim=0) / N
+
+        for _ in range(n_inner_M_steps):
+            p, s_val, q_val = current_params(detach=False)
+            phi_minor, phi_major = est._riccati(p, track_grad=True)
+            Lmaj = est._loglik_major(p, phi_major, xbar_frozen, xt, xtp1, dt, sig_M)
+            Lmin = est._loglik_minor(p, phi_minor, xbar_frozen, x0_hat_frozen, xt, xtp1, wt_frozen, dt, sig_m)
+            J = (w_frozen * Lmaj + (1 - w_frozen) * Lmin).sum()
+            loss = -J
+            opt_M.zero_grad(); loss.backward()
+            torch.nn.utils.clip_grad_norm_([g_raw, s_raw, q_raw], max_norm=5.0)
+            opt_M.step()
+            history_M.append(J.item())
+
+        with torch.no_grad():
+            p_now, s_now, q_now = current_params(detach=True)
+            cur = {'G': p_now['G'].item(), 'a_plus_q': s_now.item(), 'q': q_now.item()}
+        recent.append(cur)
+        if len(recent) > 5:
+            recent.pop(0)
+        stable = len(recent) == 5 and all(
+            (max(r[k] for r in recent) - min(r[k] for r in recent)) < 1e-3 for k in cur
+        )
+        if w_frozen.max().item() >= 0.99 and stable:
+            if verbose:
+                print(f"  early stop at EM iter {em_iter}: max(w)={w_frozen.max().item():.4f}  {cur}")
+            break
+        if verbose:
+            am = torch.softmax(theta, dim=0).argmax().item()
+            print(f"  EM iter {em_iter:3d}  J={history_E[-1]:.4e}  argmax={am}  {cur}")
+        step += 1
+
+    with torch.no_grad():
+        major_prob = torch.softmax(theta, dim=0)
+        p_final, s_final, q_final = current_params(detach=True)
+        fitted = {'G': p_final['G'].item(), 'a_plus_q': s_final.item(),
+                  'q': q_final.item(), 'a': p_final['a'].item()}
+
+    return major_prob, fitted, step
 
 
 # ----------------------------------------------------------------------------
