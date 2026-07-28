@@ -36,6 +36,27 @@ This is solved with an EM-like alternating scheme over (w, G):
 
 ell_major_i(t): log N( x_i(t+1) ; revert-to-XBAR with major rate, sigma0^2 dt )     -- w-free (if xbar observed), G-coupled via phi_0(G)
 ell_minor_i(t): log N( x_i(t+1) ; revert-to-MARKET(w,G) with minor rate, sigma^2 dt) -- w- and G-coupled
+
+xbar_drift vs xbar_control -- mirrors the split made in mfg.py's state_transtition:
+the physical mean-revert term (eq 2.1/2.3, coefficient a / a_0) reverts to the
+ACTUAL population mean, while the optimal-control term (eq 4.1/4.3, coefficient
+q-phi / q_0-phi_0) responds to the MEAN-FIELD LIMIT xbar_t (Theorem 4.1's
+xbar_t, eq 4.5). xbar_drift is always the (soft, w-weighted) empirical mean of
+minor agents. xbar_control is a confidence-weighted BLEND of that same
+empirical mean and the self-consistent solution of eq (4.5) itself:
+    xbar_control = beta*xbar_mf + (1-beta)*xbar_emp
+where beta = self._meanfield_beta in [0,1] ramps up monotonically (see
+`_param_confidence` / fit()) as the unknown parameters stabilize -- integrating
+eq (4.5) from bad early-EM parameter guesses would inject noise into the
+control-term gradient at beta~0, so it fades in gradually rather than a hard
+switch (a hard 0/1 ratchet has a real failure mode: if the early-stop
+condition and "params just stabilized" coincide in the same EM iteration, the
+switch never gets exercised before the loop exits -- a smooth ramp avoids that
+by mattering for several iterations on the way to full confidence, not just
+at the threshold-crossing instant). See `_xbar_signals` for the selection
+logic, including the `observed_xbar` override for a future TIER-1 regime
+where the true mean-field trajectory is directly observed (not yet exploited
+beyond substitution -- e.g. no ODE-consistency residual loss yet).
 """
 
 import numpy as np
@@ -169,8 +190,34 @@ class MajorAgentEstimator:
     _PHI_MINOR_DEPS = {'a', 'q', 'epslon', 'c'}
 
     def __init__(self, mfg: MFG, unknown, lr_E=0.05, lr_M=0.05, lam_entropy=0.0,
-                 leave_one_out=True, temp_anneal=False, init=None):
+                 leave_one_out=True, temp_anneal=False, init=None, observed_xbar=None,
+                 ode_sigma=1e-3):
         self.mfg = mfg
+        # TIER-1 hook: if the true mean-field trajectory is directly observed
+        # (e.g. utility.make_example's 2nd return value, x_bar[0] from
+        # mfg.simulate -- full (Ndt+1,), NOT pre-sliced to xt), it does two
+        # things -- see _xbar_signals and _loglik_meanfield_ode:
+        #   1. overrides xbar_control entirely (sliced to [:-1] there).
+        #   2. feeds a genuinely new, noise-free estimating equation: eq (4.5)
+        #      has no diffusion term, so the OBSERVED xbar's own increments
+        #      must exactly match the ODE's prediction at the true params --
+        #      a much sharper constraint on (a, q, G) than the diffusion-
+        #      corrupted state-transition likelihoods alone (though NOT fully
+        #      identifying: phi_minor's ODE only sees a,q through (a+q) and
+        #      q^2, so this alone leaves an exact two-fold ambiguity between
+        #      (a,q) and (a+2q,-q) -- see conversation).
+        self.observed_xbar = (
+            None if observed_xbar is None
+            else torch.as_tensor(np.asarray(observed_xbar), dtype=torch.float64)
+        )
+        # trust level for the eq (4.5) consistency check -- NOT real noise
+        # (the equation is exact), just how tightly to weight the residual
+        # relative to the genuinely noisy sig_M/sig_m state-transition terms.
+        self.ode_sigma = ode_sigma
+        # monotonic confidence ratchet in [0,1] (never decreases): how much of
+        # xbar_control comes from the self-consistent eq (4.5) solve vs. the
+        # empirical-mean proxy, see _xbar_signals / _param_confidence / fit().
+        self._meanfield_beta = 0.0
         self.unknown = list(unknown)
         unknown_set = set(self.unknown)
         for name in self.unknown:
@@ -238,18 +285,128 @@ class MajorAgentEstimator:
                 phi_major_full = torch.as_tensor(self.mfg.phi_0, dtype=torch.float64)
         return phi_minor_full[:-1], phi_major_full[:-1]
 
-    def _loglik_major(self, p, phi_major, xbar, xt, xtp1, dt, sig_M):
-        mu = xt + (p['a_0'] + (p['q_0'] - phi_major)) * (xbar.unsqueeze(0) - xt) * dt
+    def _meanfield_xbar(self, p, phi_minor, x0_hat, xbar0, dt):
+        """
+        Differentiable forward-Euler solve of the mean-field equation
+        (mfg.py eq 4.5 / paper eq 3.9):
+            d xbar_t = (a+q-phi_t) * ((F-1)*xbar_t + G*x0_t) dt
+        seeded at xbar0, driven by the (soft) major trajectory x0_hat.
+        phi_minor, x0_hat: (Ndt,) aligned to xt. Returns (Ndt,) xbar_mf,
+        also aligned to xt (xbar_mf[0] == xbar0).
+        """
+        Ndt = x0_hat.shape[0]
+        F = 1 - p['G']
+        coef = p['a'] + p['q'] - phi_minor                                  # (Ndt,)
+        xbar = [None] * Ndt
+        xbar[0] = xbar0
+        for k in range(Ndt - 1):
+            xbar[k + 1] = xbar[k] + coef[k] * ((F - 1) * xbar[k] + p['G'] * x0_hat[k]) * dt
+        return torch.stack(xbar)
+
+    @staticmethod
+    def _param_confidence(raw, recent_params):
+        """
+        Continuous confidence-in-parameters score in [0,1], generalizing the
+        boolean params_stable check in fit(): for each unknown parameter,
+        1.0 once its relative range over the last 5 EM iterations has settled
+        below a tight tolerance, 0.0 while it's still moving by more than a
+        loose one, linearly interpolated between -- then the MIN over all
+        unknown params (only as confident as the least-converged one, same
+        "all params must qualify" spirit as the old `all(...)` check).
+        `raw` is the dict of raw (unconstrained) tensors being estimated --
+        only used to know which names to check; values come from recent_params.
+        """
+        if not raw:
+            return 1.0
+        if len(recent_params) < 5:
+            return 0.0
+        TIGHT, LOOSE = 1e-3, 0.05  # relative-spread thresholds: beta=1 / beta=0
+        betas = []
+        for name in raw:
+            vals = [r[name] for r in recent_params]
+            spread = max(vals) - min(vals)
+            scale = max(abs(vals[-1]), 1e-8)
+            rel = spread / scale
+            betas.append(float(np.clip((LOOSE - rel) / (LOOSE - TIGHT), 0.0, 1.0)))
+        return min(betas)
+
+    def _xbar_signals(self, p, phi_minor, x0_hat, xbar_emp, dt):
+        """
+        Returns (xbar_drift, xbar_control) -- see module docstring. Drift is
+        always the empirical mean. Control is:
+          1. self.observed_xbar, if given -- sliced to [:-1] to align with
+             xbar_emp/xt (self.observed_xbar is stored full-length, (Ndt+1,),
+             since _loglik_meanfield_ode needs both endpoints of each step).
+          2. otherwise a confidence-weighted blend
+                 beta*xbar_mf + (1-beta)*xbar_emp
+             where xbar_mf is eq (4.5) self-consistently solved from the
+             CURRENT parameter estimates and beta = self._meanfield_beta (see
+             _param_confidence / fit()) -- at beta=0 this is identical to
+             xbar_emp (no ODE solve needed, skipped), at beta=1 it's the pure
+             self-consistent mean field.
+        """
+        if self.observed_xbar is not None:
+            return xbar_emp, self.observed_xbar[:-1]
+        beta = self._meanfield_beta
+        if beta <= 0.0:
+            return xbar_emp, xbar_emp
+        xbar_mf = self._meanfield_xbar(p, phi_minor, x0_hat, xbar_emp[0], dt)
+        xbar_control = beta * xbar_mf + (1 - beta) * xbar_emp if beta < 1.0 else xbar_mf
+        return xbar_emp, xbar_control
+
+    def _meanfield_residual(self, p, phi_minor, x0_hat, dt):
+        """
+        Per-step residual of eq (4.5), built directly from self.observed_xbar's
+        OWN increments -- a "collocation" formulation, not the "shooting"
+        formulation _meanfield_xbar uses (which integrates forward from an
+        initial condition and so compounds parameter error over all Ndt
+        steps). Each residual here only spans one step, so every timestep is
+        an independent, noise-free constraint on (a, q, G) -- eq (4.5) has no
+        diffusion term, it's an exact equality at the true parameters, not a
+        probabilistic one. phi_minor, x0_hat: (Ndt,) aligned to xt.
+        Returns (Ndt,) residuals (actual increment minus predicted increment).
+        """
+        xbar_true = self.observed_xbar                                     # (Ndt+1,)
+        F = 1 - p['G']
+        predicted_incr = (p['a'] + p['q'] - phi_minor) * (
+            (F - 1) * xbar_true[:-1] + p['G'] * x0_hat
+        ) * dt
+        actual_incr = xbar_true[1:] - xbar_true[:-1]
+        return actual_incr - predicted_incr
+
+    def _loglik_meanfield_ode(self, p, phi_minor, x0_hat, dt):
+        """
+        log N(0, ode_sigma) density of the eq (4.5) residual -- an extra
+        estimating equation on top of Lmaj/Lmin, only available when
+        self.observed_xbar is set (TIER 1). See _meanfield_residual and the
+        class/module docstrings for why this helps (and its limits: an exact
+        two-fold (a,q) vs (a+2q,-q) ambiguity survives from this term alone).
+        """
+        resid = self._meanfield_residual(p, phi_minor, x0_hat, dt)
+        return dist.Normal(0.0, self.ode_sigma).log_prob(resid).sum()
+
+    def _loglik_major(self, p, phi_major, xbar_drift, xbar_control, xt, xtp1, dt, sig_M):
+        # eq (2.1)/(3.5) drift term reverts to the actual population mean;
+        # eq (4.1) optimal control responds to the mean-field limit xbar_t.
+        drift = p['a_0'] * (xbar_drift.unsqueeze(0) - xt)
+        ctrl = (p['q_0'] - phi_major) * (xbar_control.unsqueeze(0) - xt)
+        mu = xt + (drift + ctrl) * dt
         return dist.Normal(mu, sig_M).log_prob(xtp1).sum(dim=1)
 
-    def _loglik_minor(self, p, phi_minor, xbar, x0_hat, xt, xtp1, wt, dt, sig_m):
-        k = (p['a'] + (p['q'] - phi_minor)) * dt
+    def _loglik_minor(self, p, phi_minor, xbar_drift, xbar_control, x0_hat, xt, xtp1, wt, dt, sig_m):
         if self.leave_one_out:
             x0_hat_i = x0_hat.unsqueeze(0) - wt * xt
         else:
             x0_hat_i = x0_hat.unsqueeze(0).expand_as(xt)
-        market_i = (1 - p['G']) * xbar.unsqueeze(0) + p['G'] * x0_hat_i
-        mu = xt + k * (market_i - xt)
+        # eq (2.3)/(3.7) drift term reverts to the actual market state;
+        # eq (4.3) optimal control responds to the mean-field market state.
+        # The major-bank component (G*x0_hat_i) is the same in both -- there's
+        # only one major bank, so no drift-vs-meanfield distinction applies to it.
+        market_drift = (1 - p['G']) * xbar_drift.unsqueeze(0) + p['G'] * x0_hat_i
+        market_control = (1 - p['G']) * xbar_control.unsqueeze(0) + p['G'] * x0_hat_i
+        drift = p['a'] * (market_drift - xt)
+        ctrl = (p['q'] - phi_minor) * (market_control - xt)
+        mu = xt + (drift + ctrl) * dt
         return dist.Normal(mu, sig_m).log_prob(xtp1).sum(dim=1)
 
     def fit(self, X, true_major_idx=None, n_em_iters=50, n_inner_E_steps=20,
@@ -287,14 +444,25 @@ class MajorAgentEstimator:
             p_frozen = self._param_values(detach=True)
             phi_minor_f, phi_major_f = self._riccati(p_frozen, track_grad=False)
 
+            # xbar_control: refreshed once per EM iter, not per inner E-step --
+            # the eq (4.5) solve is an O(Ndt) sequential recursion, and w is
+            # already moving every inner step via the live xbar_emp/x0_hat
+            # used for the drift term, so a per-em_iter snapshot of the major
+            # trajectory is enough to seed it without re-solving 20x per iter.
+            with torch.no_grad():
+                w_snap = torch.softmax(theta, dim=0)
+                x0_hat_snap = (w_snap.unsqueeze(1) * xt).sum(dim=0)
+                xbar_emp_snap = ((1 - w_snap).unsqueeze(1) * xt).sum(dim=0) / N
+                _, xbar_ctrl_E = self._xbar_signals(p_frozen, phi_minor_f, x0_hat_snap, xbar_emp_snap, dt)
+
             for _ in range(n_inner_E_steps):
                 w = torch.softmax(theta / tau, dim=0)
                 wt = w.unsqueeze(1)
                 x0_hat = (wt * xt).sum(dim=0)
-                xbar = ((1 - w).unsqueeze(1) * xt).sum(dim=0) / N
+                xbar_emp = ((1 - w).unsqueeze(1) * xt).sum(dim=0) / N
 
-                Lmaj = self._loglik_major(p_frozen, phi_major_f, xbar, xt, xtp1, dt, sig_M)
-                Lmin = self._loglik_minor(p_frozen, phi_minor_f, xbar, x0_hat, xt, xtp1, wt, dt, sig_m)
+                Lmaj = self._loglik_major(p_frozen, phi_major_f, xbar_emp, xbar_ctrl_E, xt, xtp1, dt, sig_M)
+                Lmin = self._loglik_minor(p_frozen, phi_minor_f, xbar_emp, xbar_ctrl_E, x0_hat, xt, xtp1, wt, dt, sig_m)
                 J = (w * Lmaj + (1 - w) * Lmin).sum()
                 # normalized to [0,1] by H's own ceiling log(Np1) (max entropy,
                 # attained at uniform w) so lam_entropy means the same thing
@@ -313,15 +481,26 @@ class MajorAgentEstimator:
                 w_frozen = torch.softmax(theta, dim=0)
                 wt_frozen = w_frozen.unsqueeze(1)
                 x0_hat_frozen = (wt_frozen * xt).sum(dim=0)
-                xbar_frozen = ((1 - w_frozen).unsqueeze(1) * xt).sum(dim=0) / N
+                xbar_emp_frozen = ((1 - w_frozen).unsqueeze(1) * xt).sum(dim=0) / N
 
             if opt_M is not None:
                 for _ in range(n_inner_M_steps):
                     p = self._param_values(detach=False)
                     phi_minor, phi_major = self._riccati(p, track_grad=True)
-                    Lmaj = self._loglik_major(p, phi_major, xbar_frozen, xt, xtp1, dt, sig_M)
-                    Lmin = self._loglik_minor(p, phi_minor, xbar_frozen, x0_hat_frozen, xt, xtp1, wt_frozen, dt, sig_m)
+                    # recomputed every M-substep (tracked) so xbar_control's
+                    # dependence on the current a/q/G/phi estimates -- whenever
+                    # beta > 0 -- carries proper gradient into the M-step.
+                    _, xbar_ctrl_M = self._xbar_signals(p, phi_minor, x0_hat_frozen, xbar_emp_frozen, dt)
+                    Lmaj = self._loglik_major(p, phi_major, xbar_emp_frozen, xbar_ctrl_M, xt, xtp1, dt, sig_M)
+                    Lmin = self._loglik_minor(p, phi_minor, xbar_emp_frozen, xbar_ctrl_M, x0_hat_frozen, xt, xtp1, wt_frozen, dt, sig_m)
                     J = (w_frozen * Lmaj + (1 - w_frozen) * Lmin).sum()
+                    if self.observed_xbar is not None:
+                        # noise-free eq (4.5) consistency term (TIER 1),
+                        # M-step ONLY -- w is frozen here, so unlike the
+                        # E-step this can't "cheat" by moving w to compensate
+                        # for wrong params; it can only push a/q/G toward
+                        # satisfying the exact constraint. See conversation.
+                        J = J + self._loglik_meanfield_ode(p, phi_minor, x0_hat_frozen, dt)
                     loss = -J
                     opt_M.zero_grad(); loss.backward()
                     gnorm = torch.nn.utils.clip_grad_norm_(list(self.raw.values()), max_norm=5.0)
@@ -333,8 +512,9 @@ class MajorAgentEstimator:
                 with torch.no_grad():
                     p = self._param_values(detach=True)
                     phi_minor, phi_major = self._riccati(p, track_grad=False)
-                    Lmaj = self._loglik_major(p, phi_major, xbar_frozen, xt, xtp1, dt, sig_M)
-                    Lmin = self._loglik_minor(p, phi_minor, xbar_frozen, x0_hat_frozen, xt, xtp1, wt_frozen, dt, sig_m)
+                    _, xbar_ctrl_M = self._xbar_signals(p, phi_minor, x0_hat_frozen, xbar_emp_frozen, dt)
+                    Lmaj = self._loglik_major(p, phi_major, xbar_emp_frozen, xbar_ctrl_M, xt, xtp1, dt, sig_M)
+                    Lmin = self._loglik_minor(p, phi_minor, xbar_emp_frozen, xbar_ctrl_M, x0_hat_frozen, xt, xtp1, wt_frozen, dt, sig_m)
                     self.history_M.append((w_frozen * Lmaj + (1 - w_frozen) * Lmin).sum().item())
 
             # --- early stop: w committed AND every unknown param stable ---
@@ -348,6 +528,10 @@ class MajorAgentEstimator:
                     (max(r[name] for r in recent_params) - min(r[name] for r in recent_params)) < 1e-3
                     for name in self.raw
                 )
+            )
+            # monotonic confidence ratchet -- see _xbar_signals / _param_confidence.
+            self._meanfield_beta = max(
+                self._meanfield_beta, self._param_confidence(self.raw, recent_params)
             )
             if w_frozen.max().item() >= 0.99 and params_stable:
                 if verbose:
@@ -372,6 +556,36 @@ class MajorAgentEstimator:
         self._X, self._true_major, self._true_major_idx = X, true_major, true_major_idx
         self.major_prob, self.fitted_params, self.n_steps_taken = major_prob, fitted, step
         return major_prob, fitted, step
+
+    def estimated_xbar(self):
+        """
+        Mean-field trajectories at the fitted solution -- call after fit().
+        Returns (xbar_emp, xbar_mf), each a (Ndt,) numpy array aligned to xt
+        (i.e. to X[:, :-1]):
+          - xbar_emp: the fitted-w-weighted empirical mean of minor agents.
+          - xbar_mf:  the ESTIMATED mean field -- eq (4.5) self-consistently
+            solved from the fitted parameters and the fitted soft major
+            trajectory x0_hat (same construction xbar_control uses inside
+            fit(), but at the terminal/fitted params rather than a mid-
+            training blend).
+        Compare against the TRUE mean field (e.g. utility.make_example's
+        second return value -- mfg.simulate's x_bar[0], the actual eq (4.5)
+        path driven by the real major trajectory and true parameters) only
+        available in simulation studies where ground truth is known.
+        """
+        if not hasattr(self, '_X'):
+            raise RuntimeError("call fit() first")
+        dt = self.mfg.dt
+        xt = self._X[:, :-1]
+        N = self._X.shape[0] - 1
+        with torch.no_grad():
+            w = self.major_prob
+            x0_hat = (w.unsqueeze(1) * xt).sum(dim=0)
+            xbar_emp = ((1 - w).unsqueeze(1) * xt).sum(dim=0) / N
+            p = self._param_values(detach=True)
+            phi_minor, _ = self._riccati(p, track_grad=False)
+            xbar_mf = self._meanfield_xbar(p, phi_minor, x0_hat, xbar_emp[0], dt)
+        return xbar_emp.numpy(), xbar_mf.numpy()
 
     # ------------------------------------------------------------------
     # Diagnostics -- separated from fit() so they can be (re)plotted without
@@ -433,6 +647,57 @@ class MajorAgentEstimator:
         print(f"  saved major trajectory dynamics plot to {path}")
 
 
+class UObservedEstimator(MajorAgentEstimator):
+    """
+    TIER 2.5 (Case 2 from conversation): the control u_t is directly observed
+    for EVERY agent (major and minor), on top of the states X -- e.g. actual
+    borrowing/lending actions were logged, not just reserve balances. Adds a
+    THIRD, noise-free estimating equation on top of Lmaj/Lmin: the optimal
+    control laws (eq 4.1/4.3) are DETERMINISTIC given (a,q,G,phi,phi_0) and
+    the market state -- q enters them LINEARLY, unlike phi_minor's own ODE
+    where q only appears as q^2 (see conversation: that's exactly why
+    TIER-1's x-bar-only info left an exact two-fold (a,q)<->(a+2q,-q)
+    ambiguity that this does not).
+
+    Deliberately does NOT touch or subclass around MajorAgentEstimator's
+    fit() -- fit() calls self._loglik_minor(...)/self._loglik_major(...) by
+    NAME (not MajorAgentEstimator._loglik_minor(...)), so Python's normal
+    virtual dispatch means overriding just those two methods here is enough:
+    every E-step, M-step, early-stop check, and _meanfield_beta ramp in the
+    inherited fit() automatically picks up the u-based term with ZERO changes
+    to MajorAgentEstimator. That's the whole "polymorphism" trick -- fit()
+    itself is reused completely unmodified.
+    """
+
+    def __init__(self, mfg: MFG, unknown, u, u_sigma=1e-3, **kwargs):
+        super().__init__(mfg, unknown, **kwargs)
+        # u: (N+1, Ndt) observed control for EVERY agent, same row order as
+        # the X later passed to fit(), aligned to xt (one u value per
+        # transition -- same convention _loglik_major/_loglik_minor use for
+        # xt/xtp1).
+        self.u = torch.as_tensor(np.asarray(u), dtype=torch.float64)
+        # trust level for eq (4.1)/(4.3) -- NOT real noise (the control laws
+        # are exact), just how tightly to weight this against sig_M/sig_m.
+        self.u_sigma = u_sigma
+
+    def _loglik_major(self, p, phi_major, xbar_drift, xbar_control, xt, xtp1, dt, sig_M):
+        base = super()._loglik_major(p, phi_major, xbar_drift, xbar_control, xt, xtp1, dt, sig_M)
+        u_pred = (p['q_0'] - phi_major) * (xbar_control.unsqueeze(0) - xt)   # eq (4.1)
+        u_ll = dist.Normal(u_pred, self.u_sigma).log_prob(self.u).sum(dim=1)
+        return base + u_ll
+
+    def _loglik_minor(self, p, phi_minor, xbar_drift, xbar_control, x0_hat, xt, xtp1, wt, dt, sig_m):
+        base = super()._loglik_minor(p, phi_minor, xbar_drift, xbar_control, x0_hat, xt, xtp1, wt, dt, sig_m)
+        if self.leave_one_out:
+            x0_hat_i = x0_hat.unsqueeze(0) - wt * xt
+        else:
+            x0_hat_i = x0_hat.unsqueeze(0).expand_as(xt)
+        market_control = (1 - p['G']) * xbar_control.unsqueeze(0) + p['G'] * x0_hat_i
+        u_pred = (p['q'] - phi_minor) * (market_control - xt)               # eq (4.3)
+        u_ll = dist.Normal(u_pred, self.u_sigma).log_prob(self.u).sum(dim=1)
+        return base + u_ll
+
+
 # ----------------------------------------------------------------------------
 # TEMPORARY / experimental: hardcoded to unknown={'G','a','q'}, testing
 # whether reparametrizing the M-step to (a+q, q) instead of (a, q) directly
@@ -491,8 +756,11 @@ def fit_G_a_plus_q(mfg: MFG, X, true_major_idx=None, n_em_iters=100,
             wt = w.unsqueeze(1)
             x0_hat = (wt * xt).sum(dim=0)
             xbar = ((1 - w).unsqueeze(1) * xt).sum(dim=0) / N
-            Lmaj = est._loglik_major(p_frozen, phi_major_f, xbar, xt, xtp1, dt, sig_M)
-            Lmin = est._loglik_minor(p_frozen, phi_minor_f, xbar, x0_hat, xt, xtp1, wt, dt, sig_m)
+            # unsplit (xbar used for both drift and control) -- this function
+            # is temporary/experimental and out of scope for the drift-vs-
+            # meanfield split, see MajorAgentEstimator.fit() for that.
+            Lmaj = est._loglik_major(p_frozen, phi_major_f, xbar, xbar, xt, xtp1, dt, sig_M)
+            Lmin = est._loglik_minor(p_frozen, phi_minor_f, xbar, xbar, x0_hat, xt, xtp1, wt, dt, sig_m)
             J = (w * Lmaj + (1 - w) * Lmin).sum()
             H_w = -(w * torch.log(w + 1e-12)).sum() / np.log(Np1)
             loss = -(J - lam_entropy * H_w)
@@ -508,8 +776,8 @@ def fit_G_a_plus_q(mfg: MFG, X, true_major_idx=None, n_em_iters=100,
         for _ in range(n_inner_M_steps):
             p, s_val, q_val = current_params(detach=False)
             phi_minor, phi_major = est._riccati(p, track_grad=True)
-            Lmaj = est._loglik_major(p, phi_major, xbar_frozen, xt, xtp1, dt, sig_M)
-            Lmin = est._loglik_minor(p, phi_minor, xbar_frozen, x0_hat_frozen, xt, xtp1, wt_frozen, dt, sig_m)
+            Lmaj = est._loglik_major(p, phi_major, xbar_frozen, xbar_frozen, xt, xtp1, dt, sig_M)
+            Lmin = est._loglik_minor(p, phi_minor, xbar_frozen, xbar_frozen, x0_hat_frozen, xt, xtp1, wt_frozen, dt, sig_m)
             J = (w_frozen * Lmaj + (1 - w_frozen) * Lmin).sum()
             loss = -J
             opt_M.zero_grad(); loss.backward()
@@ -519,7 +787,7 @@ def fit_G_a_plus_q(mfg: MFG, X, true_major_idx=None, n_em_iters=100,
 
         with torch.no_grad():
             p_now, s_now, q_now = current_params(detach=True)
-            cur = {'G': p_now['G'].item(), 'a_plus_q': s_now.item(), 'q': q_now.item()}
+            cur = {'G': p_now['G'].item(), 'a_plus_q': s_now.item(), 'a': s_now.item()-q_now.item(), 'q': q_now.item()}
         recent.append(cur)
         if len(recent) > 5:
             recent.pop(0)

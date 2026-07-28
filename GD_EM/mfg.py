@@ -106,23 +106,29 @@ class MFG:
             * self.dt
         )                                                                    # (N_sim,)
 
-        # major bank: SDE (eq 3.5) + optimal control (eq 4.1)
+        # major bank: SDE (eq 3.5 / eq 2.1) + optimal control (eq 4.1)
+        # eq 2.1 mean-revert term uses x^(N)_t, the actual empirical mean of
+        # minor bank states, rather than the mean-field limit x_bar
+        x_minor_mean = x_minor.mean(axis=1)                                 # (N_sim,)
         u_major = (self.q_0 - phi_0_t) * (x_bar - x_major)                 # (N_sim,)
         x_major_next = (
             x_major
-            + self.a_0 * (x_bar - x_major) * self.dt
+            + self.a_0 * (x_minor_mean - x_major) * self.dt
             + u_major * self.dt
             + self.sigma_0 * np.sqrt(self.dt) * np.random.randn(*x_major.shape)
         )                                                                    # (N_sim,)
 
         # market state: (N_sim, 1) broadcasts against (N_sim, N)
         market_state = self.F * x_bar[:, None] + self.G * x_major[:, None] # (N_sim, 1)
+        # eq 2.3 mean-revert term uses x^(N)_t, the actual empirical mean of
+        # minor bank states, rather than the mean-field limit x_bar
+        market_state_mean = self.F * x_minor_mean[:, None] + self.G * x_major[:, None]  # (N_sim, 1)
 
         # minor banks: SDE (eq 3.7) + optimal control (eq 4.3)
         u_minor = (self.q - phi_t) * (market_state - x_minor)               # (N_sim, N)
         x_minor_next = (
             x_minor
-            + self.a * (market_state - x_minor) * self.dt
+            + self.a * (market_state_mean - x_minor) * self.dt
             + u_minor * self.dt
             + self.sigma * np.sqrt(self.dt) * np.random.randn(*x_minor.shape)
         )                                                                    # (N_sim, N)
