@@ -36,6 +36,27 @@ This is solved with an EM-like alternating scheme over (w, G):
 
 ell_major_i(t): log N( x_i(t+1) ; revert-to-XBAR with major rate, sigma0^2 dt )     -- w-free (if xbar observed), G-coupled via phi_0(G)
 ell_minor_i(t): log N( x_i(t+1) ; revert-to-MARKET(w,G) with minor rate, sigma^2 dt) -- w- and G-coupled
+
+xbar_drift vs xbar_control -- mirrors the split made in mfg.py's state_transtition:
+the physical mean-revert term (eq 2.1/2.3, coefficient a / a_0) reverts to the
+ACTUAL population mean, while the optimal-control term (eq 4.1/4.3, coefficient
+q-phi / q_0-phi_0) responds to the MEAN-FIELD LIMIT xbar_t (Theorem 4.1's
+xbar_t, eq 4.5). xbar_drift is always the (soft, w-weighted) empirical mean of
+minor agents. xbar_control is a confidence-weighted BLEND of that same
+empirical mean and the self-consistent solution of eq (4.5) itself:
+    xbar_control = beta*xbar_mf + (1-beta)*xbar_emp
+where beta = self._meanfield_beta in [0,1] ramps up monotonically (see
+`_param_confidence` / fit()) as the unknown parameters stabilize -- integrating
+eq (4.5) from bad early-EM parameter guesses would inject noise into the
+control-term gradient at beta~0, so it fades in gradually rather than a hard
+switch (a hard 0/1 ratchet has a real failure mode: if the early-stop
+condition and "params just stabilized" coincide in the same EM iteration, the
+switch never gets exercised before the loop exits -- a smooth ramp avoids that
+by mattering for several iterations on the way to full confidence, not just
+at the threshold-crossing instant). See `_xbar_signals` for the selection
+logic, including the `observed_xbar` override for a future TIER-1 regime
+where the true mean-field trajectory is directly observed (not yet exploited
+beyond substitution -- e.g. no ODE-consistency residual loss yet).
 """
 
 import numpy as np
@@ -43,530 +64,752 @@ import torch
 import torch.distributions as dist
 from mfg import MFG, MFG_config
 import matplotlib.pyplot as plt
-
-def _solve_phi0_torch(G, phi_full, mfg):
-    """
-    Differentiable backward-Euler solve of the major Riccati ODE (mirrors
-    MFG.solve_ODE()'s phi_0 recursion), keeping G attached to the autograd graph.
-
-    phi_full : (Ndt+1,) tensor, the fixed (G-independent) minor Riccati
-               coefficients already solved once by mfg.solve_ODE().
-    returns  : (Ndt+1,) tensor, phi_0(t) as a function of G.
-    """
-    dt, Ndt = mfg.dt, mfg.Ndt
-    a0, q0, a, q, eps0, c0 = mfg.a_0, mfg.q_0, mfg.a, mfg.q, mfg.epslon_0, mfg.c_0
-
-    phi0 = [None] * (Ndt + 1)
-    phi0[Ndt] = torch.as_tensor(-c0, dtype=torch.float64)
-    for kk in range(Ndt - 1, -1, -1):
-        prev, phi_t = phi0[kk + 1], phi_full[kk + 1]
-        dphi0 = 2 * ((a0 + q0) + G * (a + q - phi_t)) * prev - prev**2 + eps0 - q0**2
-        phi0[kk] = prev - dt * dphi0
-    return torch.stack(phi0)
+from utility import make_example
 
 
-def detect_major_G(mfg:MFG, X,true_major_idx:int,
-                         n_em_iters=50, n_inner_E_steps=20, n_inner_M_steps=20,
-                         lr_E=0.05, lr_G=0.05, lam_entropy=0.0,
-                         leave_one_out=True, temp_anneal=False,
-                         init_theta=None, init_G=None, verbose=False,
-                         fix_phi0=False):
-    """
-    mfg         : MFG instance with solve_ODE() already called.
-    X           : (N+1, Ndt+1) observed agent trajectories. Rows = agents.
-                  ORDER MUST BE LABEL-AGNOSTIC (permute before calling).
-    n_em_iters      : number of outer EM iterations (E-step + M-step).
-    n_inner_E_steps : number of Adam steps on theta per E-step (G held fixed).
-    n_inner_M_steps : number of Adam steps on G per M-step (w held fixed);
-                      phi_0(G) is re-solved, differentiably, every substep
-                      (default -- see fix_phi0 below).
-    fix_phi0    : if False (default), phi_0(G) is re-solved differentiably every E-step
-                  (detached snapshot) and every M-step substep (tracked), so
-                  ell_major is genuinely G-coupled through the major bank's
-                  own Riccati ODE, not just ell_minor through the market mix --
-                  the fully self-consistent estimator.
-                  If True, phi_0(t) is instead treated as a KNOWN, FIXED
-                  coefficient -- taken once from mfg.solve_ODE() (i.e. at
-                  mfg's own G) and never re-solved as G is estimated. ell_major
-                  is then G-free, exactly like the very first version of this
-                  file, and only ell_minor carries the direct G-coupling
-                  through the market mix. Gradient ascent on G is still used
-                  for the M-step (not the closed-form LS solution), so this is
-                  a clean ablation against fix_phi0=False: same optimizer,
-                  only difference is whether phi_0 tracks G or not.
-    returns     : (major_prob (N+1,) tensor, G (scalar tensor), history list of J values)
-    """
-    # mfg.solve_ODE()
-    dt, Ndt = mfg.dt, mfg.Ndt
-    X  = torch.as_tensor(np.asarray(X), dtype=torch.float64)
-    Np1, _ = X.shape
-    true_major = X[true_major_idx]
-    N = Np1 - 1
+# ----------------------------------------------------------------------------
+# Reparametrizations: unconstrained "raw" tensor <-> physically-constrained
+# parameter value. Every estimable parameter (see PARAM_SPECS below) goes
+# through one of these so Adam can take unconstrained steps while the value
+# fed into the Riccati ODEs / drift terms stays in its valid domain -- same
+# trick as the old g_raw = sigmoid^{-1}(G) reparametrization, generalized.
+# ----------------------------------------------------------------------------
+class _Sigmoid:
+    """value in (lo, hi). Used for G (a mixing weight)."""
+    def __init__(self, lo=0.0, hi=1.0):
+        self.lo, self.hi = lo, hi
 
-    # minor Riccati coefficient: G-independent, solved once, frozen forever
-    phi_full = torch.as_tensor(mfg.phi, dtype=torch.float64)   # (Ndt+1,)
-    phi = phi_full[:-1]                                        # (Ndt,) aligned to transitions
+    def to_value(self, raw, **_):
+        return self.lo + (self.hi - self.lo) * torch.sigmoid(raw)
 
-    if fix_phi0:
-        # major Riccati coefficient treated as KNOWN/GIVEN: taken once from
-        # mfg.solve_ODE() (solved at mfg's own G) and never touched again.
-        phi0_fixed = torch.as_tensor(mfg.phi_0[:-1], dtype=torch.float64)  # (Ndt,)
-
-    sig_M = mfg.sigma_0 * dt**0.5     # major noise std per step
-    sig_m = mfg.sigma   * dt**0.5     # minor noise std per step
-
-    a, q = mfg.a, mfg.q
-    a0, q0 = mfg.a_0, mfg.q_0
-    k = (a + (q - phi)) * dt          # (Ndt,) minor drift coefficient on (market - x), G-independent
-
-    xt   = X[:, :-1]    # (N+1, Ndt) state at t
-    xtp1 = X[:, 1:]     # (N+1, Ndt) state at t+1
-
-    def Lmaj_of(phi0_slice, xbar):
-        # ell_major_i(t): reverts to xbar with the major rate, phi_0(G)-coupled
-        mu_major = xt + (a0 + (q0 - phi0_slice)) * (xbar.unsqueeze(0) - xt) * dt  # (N+1,Ndt)
-        return dist.Normal(mu_major, sig_M).log_prob(xtp1).sum(dim=1)              # (N+1,)
-
-    def Lmin_of(w, wt, xbar, x0_hat, G_):
-        # ell_minor_i(t): reverts to market(w, G) with the minor rate
-        if leave_one_out:
-            x0_hat_i = x0_hat.unsqueeze(0) - wt * xt            # (N+1,Ndt)
-        else:
-            x0_hat_i = x0_hat.unsqueeze(0).expand_as(xt)        # (N+1,Ndt)
-        market_i = (1 - G_) * xbar.unsqueeze(0) + G_ * x0_hat_i  # (N+1,Ndt)
-        mu_minor = xt + k * (market_i - xt)                      # (N+1,Ndt)
-        return dist.Normal(mu_minor, sig_m).log_prob(xtp1).sum(dim=1)  # (N+1,)
-
-    # --- theta: E-step parameter --------------------------------------------
-    theta = (torch.zeros(Np1, dtype=torch.float64) if init_theta is None
-            else torch.as_tensor(init_theta, dtype=torch.float64).clone())
-    theta.requires_grad_(True)
-    opt_theta = torch.optim.Adam([theta], lr=lr_E)
-
-    # --- G: M-step parameter ---------------------------------------------
-    # Reparametrize G = sigmoid(g_raw) so it's confined to (0,1) no matter how
-    # large a gradient step Adam takes on g_raw. This matters: G is an ODE
-    # coefficient inside _solve_phi0_torch's explicit-Euler recursion, and an
-    # unconstrained G can wander into a regime where that recursion is
-    # numerically unstable (diverges), producing garbage phi_0 / -inf
-    # log-likelihoods / exploding gradients -- a runaway that unconstrained G
-    # has no way to recover from.
-    def _logit(p, eps=1e-6):
-        p = min(max(float(p), eps), 1 - eps)
+    def to_raw(self, value, **_):
+        p = (float(value) - self.lo) / (self.hi - self.lo)
+        p = min(max(p, 1e-6), 1 - 1e-6)
         return np.log(p / (1 - p))
 
-    g_raw_init = np.random.uniform(-1, 1) if init_G is None else _logit(init_G)
-    g_raw = torch.as_tensor(g_raw_init, dtype=torch.float64)
-    g_raw.requires_grad_(True)
-    opt_G = torch.optim.Adam([g_raw], lr=lr_G)
+    def sample_init_raw(self):
+        return np.random.uniform(-1, 1)
 
-    history_E = []      # E-step J trace (one point per theta gradient step)
-    history_M = []    # M-step J trace (one point per G gradient step)
-    recent_G = []     # rolling window of G, for the early-stop check below
-    major_snapshots = []   # (step, x0_hat_full) every 20 steps, for the trajectory-dynamics plot
-    n_steps = n_em_iters * n_inner_E_steps
+
+class _Softplus:
+    """value > shift. Used for mean-reversion rates a, a_0 (must stay positive)."""
+    def __init__(self, shift=1e-3):
+        self.shift = shift
+
+    def to_value(self, raw, **_):
+        return self.shift + torch.nn.functional.softplus(raw)
+
+    def to_raw(self, value, **_):
+        v = max(float(value) - self.shift, 1e-6)
+        return np.log(np.expm1(v))
+
+    def sample_init_raw(self):
+        return np.random.uniform(-1, 1)
+
+
+class _Identity:
+    """value unconstrained. Used for q, q_0, c, c_0."""
+    def to_value(self, raw, **_):
+        return raw
+
+    def to_raw(self, value, **_):
+        return float(value)
+
+    def sample_init_raw(self):
+        return np.random.uniform(-1, 1)
+
+
+# name -> transform. epslon/epslon_0 are independent positive scalars, same
+# treatment as a/a_0 -- deliberately NOT tied to q/q_0 via the q^2 <= epslon
+# relationship. That inequality is a real constraint on the true physical
+# parameters, but baking it into the parametrization would hand the estimator
+# privileged structural knowledge it wouldn't have from data alone; if q and
+# epslon are both unknown, the estimator has to find a consistent (and,
+# ideally, constraint-respecting) combination on its own.
+PARAM_SPECS = {
+    'G':        _Sigmoid(0.0, 1.0),
+    'a':        _Softplus(),
+    'a_0':      _Softplus(),
+    'q':        _Identity(),
+    'q_0':      _Identity(),
+    'epslon':   _Softplus(),
+    'epslon_0': _Softplus(),
+    'c':        _Identity(),
+    'c_0':      _Identity(),
+}
+PARAM_ORDER = ['G', 'a', 'a_0', 'q', 'q_0', 'epslon', 'epslon_0', 'c', 'c_0']
+
+
+def _solve_riccati_torch(coef_fn, eps, q, c, Ndt, dt):
+    """
+    Generic differentiable backward-Euler solve of
+        dphi/dt = 2*coef_fn(k, phi[k+1])*phi - phi^2 + eps - q^2
+    with terminal condition phi(T) = -c. This is the shared shape of BOTH
+    Riccati ODEs in mfg.py (eq 4.2 for the major bank, eq 4.4 for the minor
+    bank) -- they differ only in what `coef_fn` is:
+        minor: coef_fn(k, prev) = a + q                          (time-invariant)
+        major: coef_fn(k, prev) = (a_0+q_0) + G*(a+q-phi_minor[k+1])   (reads the minor solve)
+    eps, q, c may be python floats (known) or 0-d torch tensors with
+    requires_grad=True (unknown) -- either way this stays differentiable
+    w.r.t. whichever inputs are tensors.
+    returns (Ndt+1,) tensor phi(t).
+    """
+    neg_c = -c if torch.is_tensor(c) else torch.as_tensor(-c, dtype=torch.float64)
+    phi = [None] * (Ndt + 1)
+    phi[Ndt] = neg_c
+    for kk in range(Ndt - 1, -1, -1):
+        prev = phi[kk + 1]
+        coef = coef_fn(kk, prev)
+        dphi = 2 * coef * prev - prev**2 + eps - q**2
+        phi[kk] = prev - dt * dphi
+    return torch.stack(phi)
+
+
+class MajorAgentEstimator:
+    """
+    Detects the major agent among N+1 shuffled trajectories (softmax
+    relaxation over theta, same as the old detect_major_G) AND jointly
+    estimates any subset of {G, a, a_0, q, q_0, epslon, epslon_0, c, c_0}
+    declared unknown, by gradient ascent (Adam) on the joint path
+    log-likelihood -- generalizes detect_major_G's single-G M-step to N
+    unknown "physics" parameters at once.
+
+    Parameters not listed in `unknown` are treated as KNOWN and read once
+    from `mfg` (plain floats, never touched again).
+
+    phi(t) (minor Riccati, mfg.py eq 4.4) and phi0(t) (major Riccati, eq 4.2)
+    are each solved via the SAME generic recursion (_solve_riccati_torch).
+    Whichever one depends on a currently-unknown parameter is re-solved,
+    differentiably, every time parameters change (E-step start: detached
+    snapshot; M-step substep: tracked). If NONE of an ODE's inputs are
+    unknown, it's taken once from mfg.solve_ODE() and reused as a fixed
+    constant -- this is exactly detect_major_G's fix_phi0 flag, generalized
+    to be decided automatically (per-ODE) from `unknown` instead of set by hand.
+    """
+
+    _PHI_MINOR_DEPS = {'a', 'q', 'epslon', 'c'}
+
+    def __init__(self, mfg: MFG, unknown, lr_E=0.05, lr_M=0.05, lam_entropy=0.0,
+                 leave_one_out=True, temp_anneal=False, init=None, observed_xbar=None,
+                 ode_sigma=1e-3):
+        self.mfg = mfg
+        # TIER-1 hook: if the true mean-field trajectory is directly observed
+        # (e.g. utility.make_example's 2nd return value, x_bar[0] from
+        # mfg.simulate -- full (Ndt+1,), NOT pre-sliced to xt), it does two
+        # things -- see _xbar_signals and _loglik_meanfield_ode:
+        #   1. overrides xbar_control entirely (sliced to [:-1] there).
+        #   2. feeds a genuinely new, noise-free estimating equation: eq (4.5)
+        #      has no diffusion term, so the OBSERVED xbar's own increments
+        #      must exactly match the ODE's prediction at the true params --
+        #      a much sharper constraint on (a, q, G) than the diffusion-
+        #      corrupted state-transition likelihoods alone (though NOT fully
+        #      identifying: phi_minor's ODE only sees a,q through (a+q) and
+        #      q^2, so this alone leaves an exact two-fold ambiguity between
+        #      (a,q) and (a+2q,-q) -- see conversation).
+        self.observed_xbar = (
+            None if observed_xbar is None
+            else torch.as_tensor(np.asarray(observed_xbar), dtype=torch.float64)
+        )
+        # trust level for the eq (4.5) consistency check -- NOT real noise
+        # (the equation is exact), just how tightly to weight the residual
+        # relative to the genuinely noisy sig_M/sig_m state-transition terms.
+        self.ode_sigma = ode_sigma
+        # monotonic confidence ratchet in [0,1] (never decreases): how much of
+        # xbar_control comes from the self-consistent eq (4.5) solve vs. the
+        # empirical-mean proxy, see _xbar_signals / _param_confidence / fit().
+        self._meanfield_beta = 0.0
+        self.unknown = list(unknown)
+        unknown_set = set(self.unknown)
+        for name in self.unknown:
+            if name not in PARAM_SPECS:
+                raise ValueError(f"unknown parameter {name!r} has no registered transform in PARAM_SPECS")
+
+        self.lr_E, self.lr_M = lr_E, lr_M
+        self.lam_entropy = lam_entropy
+        self.leave_one_out = leave_one_out
+        self.temp_anneal = temp_anneal
+
+        init = init or {}
+        self.raw = {}
+        for name in PARAM_ORDER:
+            if name in unknown_set:
+                spec = PARAM_SPECS[name]
+                r0 = spec.to_raw(init[name]) if name in init else spec.sample_init_raw()
+                self.raw[name] = torch.as_tensor(r0, dtype=torch.float64).requires_grad_(True)
+
+        # phi(t)'s ODE only ever involves {a, q, epslon, c}; phi0(t)'s ODE
+        # additionally involves {a_0, q_0, epslon_0, c_0, G} PLUS whatever
+        # phi(t) depends on (it reads phi(t) as an input) -- so if phi(t)
+        # needs re-solving, phi0(t) does too, regardless of its own params.
+        self._minor_unknown = bool(self._PHI_MINOR_DEPS & unknown_set)
+        self._major_unknown = self._minor_unknown or bool(
+            {'a_0', 'q_0', 'epslon_0', 'c_0', 'G'} & unknown_set
+        )
+
+        # histories, populated by fit() -- always recorded (not just under a
+        # verbose flag), so diagnostics can be plotted after the fact without
+        # re-running the optimization.
+        self.history_E, self.history_M = [], []
+        self.history_E_grad, self.history_M_grad = [], []
+        self.major_snapshots = []
+
+    def _param_values(self, detach: bool):
+        """dict of ALL params (known floats + unknown transformed tensors)."""
+        vals = {}
+        for name in PARAM_ORDER:
+            if name in self.raw:
+                raw = self.raw[name].detach() if detach else self.raw[name]
+                vals[name] = PARAM_SPECS[name].to_value(raw)
+            else:
+                vals[name] = getattr(self.mfg, name)
+        return vals
+
+    def _riccati(self, p, track_grad: bool):
+        """Returns (phi_minor, phi_major), each (Ndt,) aligned to transitions [:-1]."""
+        dt, Ndt = self.mfg.dt, self.mfg.Ndt
+        ctx = torch.enable_grad() if track_grad else torch.no_grad()
+        with ctx:
+            if self._minor_unknown:
+                coef = p['a'] + p['q']
+                phi_minor_full = _solve_riccati_torch(
+                    lambda k, prev: coef, p['epslon'], p['q'], p['c'], Ndt, dt)
+            else:
+                phi_minor_full = torch.as_tensor(self.mfg.phi, dtype=torch.float64)
+
+            if self._major_unknown:
+                def coef_fn(k, prev):
+                    return (p['a_0'] + p['q_0']) + p['G'] * (p['a'] + p['q'] - phi_minor_full[k + 1])
+                phi_major_full = _solve_riccati_torch(
+                    coef_fn, p['epslon_0'], p['q_0'], p['c_0'], Ndt, dt)
+            else:
+                phi_major_full = torch.as_tensor(self.mfg.phi_0, dtype=torch.float64)
+        return phi_minor_full[:-1], phi_major_full[:-1]
+
+    def _meanfield_xbar(self, p, phi_minor, x0_hat, xbar0, dt):
+        """
+        Differentiable forward-Euler solve of the mean-field equation
+        (mfg.py eq 4.5 / paper eq 3.9):
+            d xbar_t = (a+q-phi_t) * ((F-1)*xbar_t + G*x0_t) dt
+        seeded at xbar0, driven by the (soft) major trajectory x0_hat.
+        phi_minor, x0_hat: (Ndt,) aligned to xt. Returns (Ndt,) xbar_mf,
+        also aligned to xt (xbar_mf[0] == xbar0).
+        """
+        Ndt = x0_hat.shape[0]
+        F = 1 - p['G']
+        coef = p['a'] + p['q'] - phi_minor                                  # (Ndt,)
+        xbar = [None] * Ndt
+        xbar[0] = xbar0
+        for k in range(Ndt - 1):
+            xbar[k + 1] = xbar[k] + coef[k] * ((F - 1) * xbar[k] + p['G'] * x0_hat[k]) * dt
+        return torch.stack(xbar)
+
+    @staticmethod
+    def _param_confidence(raw, recent_params):
+        """
+        Continuous confidence-in-parameters score in [0,1], generalizing the
+        boolean params_stable check in fit(): for each unknown parameter,
+        1.0 once its relative range over the last 5 EM iterations has settled
+        below a tight tolerance, 0.0 while it's still moving by more than a
+        loose one, linearly interpolated between -- then the MIN over all
+        unknown params (only as confident as the least-converged one, same
+        "all params must qualify" spirit as the old `all(...)` check).
+        `raw` is the dict of raw (unconstrained) tensors being estimated --
+        only used to know which names to check; values come from recent_params.
+        """
+        if not raw:
+            return 1.0
+        if len(recent_params) < 5:
+            return 0.0
+        TIGHT, LOOSE = 1e-3, 0.05  # relative-spread thresholds: beta=1 / beta=0
+        betas = []
+        for name in raw:
+            vals = [r[name] for r in recent_params]
+            spread = max(vals) - min(vals)
+            scale = max(abs(vals[-1]), 1e-8)
+            rel = spread / scale
+            betas.append(float(np.clip((LOOSE - rel) / (LOOSE - TIGHT), 0.0, 1.0)))
+        return min(betas)
+
+    def _xbar_signals(self, p, phi_minor, x0_hat, xbar_emp, dt):
+        """
+        Returns (xbar_drift, xbar_control) -- see module docstring. Drift is
+        always the empirical mean. Control is:
+          1. self.observed_xbar, if given -- sliced to [:-1] to align with
+             xbar_emp/xt (self.observed_xbar is stored full-length, (Ndt+1,),
+             since _loglik_meanfield_ode needs both endpoints of each step).
+          2. otherwise a confidence-weighted blend
+                 beta*xbar_mf + (1-beta)*xbar_emp
+             where xbar_mf is eq (4.5) self-consistently solved from the
+             CURRENT parameter estimates and beta = self._meanfield_beta (see
+             _param_confidence / fit()) -- at beta=0 this is identical to
+             xbar_emp (no ODE solve needed, skipped), at beta=1 it's the pure
+             self-consistent mean field.
+        """
+        if self.observed_xbar is not None:
+            return xbar_emp, self.observed_xbar[:-1]
+        beta = self._meanfield_beta
+        if beta <= 0.0:
+            return xbar_emp, xbar_emp
+        xbar_mf = self._meanfield_xbar(p, phi_minor, x0_hat, xbar_emp[0], dt)
+        xbar_control = beta * xbar_mf + (1 - beta) * xbar_emp if beta < 1.0 else xbar_mf
+        return xbar_emp, xbar_control
+
+    def _meanfield_residual(self, p, phi_minor, x0_hat, dt):
+        """
+        Per-step residual of eq (4.5), built directly from self.observed_xbar's
+        OWN increments -- a "collocation" formulation, not the "shooting"
+        formulation _meanfield_xbar uses (which integrates forward from an
+        initial condition and so compounds parameter error over all Ndt
+        steps). Each residual here only spans one step, so every timestep is
+        an independent, noise-free constraint on (a, q, G) -- eq (4.5) has no
+        diffusion term, it's an exact equality at the true parameters, not a
+        probabilistic one. phi_minor, x0_hat: (Ndt,) aligned to xt.
+        Returns (Ndt,) residuals (actual increment minus predicted increment).
+        """
+        xbar_true = self.observed_xbar                                     # (Ndt+1,)
+        F = 1 - p['G']
+        predicted_incr = (p['a'] + p['q'] - phi_minor) * (
+            (F - 1) * xbar_true[:-1] + p['G'] * x0_hat
+        ) * dt
+        actual_incr = xbar_true[1:] - xbar_true[:-1]
+        return actual_incr - predicted_incr
+
+    def _loglik_meanfield_ode(self, p, phi_minor, x0_hat, dt):
+        """
+        log N(0, ode_sigma) density of the eq (4.5) residual -- an extra
+        estimating equation on top of Lmaj/Lmin, only available when
+        self.observed_xbar is set (TIER 1). See _meanfield_residual and the
+        class/module docstrings for why this helps (and its limits: an exact
+        two-fold (a,q) vs (a+2q,-q) ambiguity survives from this term alone).
+        """
+        resid = self._meanfield_residual(p, phi_minor, x0_hat, dt)
+        return dist.Normal(0.0, self.ode_sigma).log_prob(resid).sum()
+
+    def _loglik_major(self, p, phi_major, xbar_drift, xbar_control, xt, xtp1, dt, sig_M):
+        # eq (2.1)/(3.5) drift term reverts to the actual population mean;
+        # eq (4.1) optimal control responds to the mean-field limit xbar_t.
+        drift = p['a_0'] * (xbar_drift.unsqueeze(0) - xt)
+        ctrl = (p['q_0'] - phi_major) * (xbar_control.unsqueeze(0) - xt)
+        mu = xt + (drift + ctrl) * dt
+        return dist.Normal(mu, sig_M).log_prob(xtp1).sum(dim=1)
+
+    def _loglik_minor(self, p, phi_minor, xbar_drift, xbar_control, x0_hat, xt, xtp1, wt, dt, sig_m):
+        if self.leave_one_out:
+            x0_hat_i = x0_hat.unsqueeze(0) - wt * xt
+        else:
+            x0_hat_i = x0_hat.unsqueeze(0).expand_as(xt)
+        # eq (2.3)/(3.7) drift term reverts to the actual market state;
+        # eq (4.3) optimal control responds to the mean-field market state.
+        # The major-bank component (G*x0_hat_i) is the same in both -- there's
+        # only one major bank, so no drift-vs-meanfield distinction applies to it.
+        market_drift = (1 - p['G']) * xbar_drift.unsqueeze(0) + p['G'] * x0_hat_i
+        market_control = (1 - p['G']) * xbar_control.unsqueeze(0) + p['G'] * x0_hat_i
+        drift = p['a'] * (market_drift - xt)
+        ctrl = (p['q'] - phi_minor) * (market_control - xt)
+        mu = xt + (drift + ctrl) * dt
+        return dist.Normal(mu, sig_m).log_prob(xtp1).sum(dim=1)
+
+    def fit(self, X, true_major_idx=None, n_em_iters=50, n_inner_E_steps=20,
+            n_inner_M_steps=20, init_theta=None, verbose=False):
+        """
+        X : (N+1, Ndt+1) observed agent trajectories, label-agnostic order.
+        returns : (major_prob (N+1,) tensor, fitted params dict[name->float], n_steps)
+        """
+        dt, Ndt = self.mfg.dt, self.mfg.Ndt
+        X = torch.as_tensor(np.asarray(X), dtype=torch.float64)
+        Np1, _ = X.shape
+        N = Np1 - 1
+        true_major = X[true_major_idx] if true_major_idx is not None else None
+
+        sig_M = self.mfg.sigma_0 * dt**0.5
+        sig_m = self.mfg.sigma * dt**0.5
+
+        xt, xtp1 = X[:, :-1], X[:, 1:]
+
+        theta = (torch.zeros(Np1, dtype=torch.float64) if init_theta is None
+                 else torch.as_tensor(init_theta, dtype=torch.float64).clone())
+        theta.requires_grad_(True)
+        opt_theta = torch.optim.Adam([theta], lr=self.lr_E)
+        opt_M = torch.optim.Adam(list(self.raw.values()), lr=self.lr_M) if self.raw else None
+
+        recent_params = []
+        n_steps = n_em_iters * n_inner_E_steps
+        step = 0
+
+        for em_iter in range(n_em_iters + 1):
+            tau = 1.0 if not self.temp_anneal else max(0.3, 1.2 - step / n_steps)
+
+            # ============================= E-step ============================
+            # freeze all current param estimates (detached), ascend theta only.
+            p_frozen = self._param_values(detach=True)
+            phi_minor_f, phi_major_f = self._riccati(p_frozen, track_grad=False)
+
+            # xbar_control: refreshed once per EM iter, not per inner E-step --
+            # the eq (4.5) solve is an O(Ndt) sequential recursion, and w is
+            # already moving every inner step via the live xbar_emp/x0_hat
+            # used for the drift term, so a per-em_iter snapshot of the major
+            # trajectory is enough to seed it without re-solving 20x per iter.
+            with torch.no_grad():
+                w_snap = torch.softmax(theta, dim=0)
+                x0_hat_snap = (w_snap.unsqueeze(1) * xt).sum(dim=0)
+                xbar_emp_snap = ((1 - w_snap).unsqueeze(1) * xt).sum(dim=0) / N
+                _, xbar_ctrl_E = self._xbar_signals(p_frozen, phi_minor_f, x0_hat_snap, xbar_emp_snap, dt)
+
+            for _ in range(n_inner_E_steps):
+                w = torch.softmax(theta / tau, dim=0)
+                wt = w.unsqueeze(1)
+                x0_hat = (wt * xt).sum(dim=0)
+                xbar_emp = ((1 - w).unsqueeze(1) * xt).sum(dim=0) / N
+
+                Lmaj = self._loglik_major(p_frozen, phi_major_f, xbar_emp, xbar_ctrl_E, xt, xtp1, dt, sig_M)
+                Lmin = self._loglik_minor(p_frozen, phi_minor_f, xbar_emp, xbar_ctrl_E, x0_hat, xt, xtp1, wt, dt, sig_m)
+                J = (w * Lmaj + (1 - w) * Lmin).sum()
+                # normalized to [0,1] by H's own ceiling log(Np1) (max entropy,
+                # attained at uniform w) so lam_entropy means the same thing
+                # regardless of how many agents (N+1) are in play -- see
+                # solver.py history / conversation for the derivation.
+                H_w = -(w * torch.log(w + 1e-12)).sum() / np.log(Np1)
+                loss = -(J - self.lam_entropy * H_w)
+                opt_theta.zero_grad(); loss.backward()
+                self.history_E_grad.append(theta.grad.norm().item())
+                opt_theta.step()
+                self.history_E.append(J.item())
+
+            # ============================= M-step ============================
+            # freeze w, jointly ascend every currently-unknown raw parameter.
+            with torch.no_grad():
+                w_frozen = torch.softmax(theta, dim=0)
+                wt_frozen = w_frozen.unsqueeze(1)
+                x0_hat_frozen = (wt_frozen * xt).sum(dim=0)
+                xbar_emp_frozen = ((1 - w_frozen).unsqueeze(1) * xt).sum(dim=0) / N
+
+            if opt_M is not None:
+                for _ in range(n_inner_M_steps):
+                    p = self._param_values(detach=False)
+                    phi_minor, phi_major = self._riccati(p, track_grad=True)
+                    # recomputed every M-substep (tracked) so xbar_control's
+                    # dependence on the current a/q/G/phi estimates -- whenever
+                    # beta > 0 -- carries proper gradient into the M-step.
+                    _, xbar_ctrl_M = self._xbar_signals(p, phi_minor, x0_hat_frozen, xbar_emp_frozen, dt)
+                    Lmaj = self._loglik_major(p, phi_major, xbar_emp_frozen, xbar_ctrl_M, xt, xtp1, dt, sig_M)
+                    Lmin = self._loglik_minor(p, phi_minor, xbar_emp_frozen, xbar_ctrl_M, x0_hat_frozen, xt, xtp1, wt_frozen, dt, sig_m)
+                    J = (w_frozen * Lmaj + (1 - w_frozen) * Lmin).sum()
+                    if self.observed_xbar is not None:
+                        # noise-free eq (4.5) consistency term (TIER 1),
+                        # M-step ONLY -- w is frozen here, so unlike the
+                        # E-step this can't "cheat" by moving w to compensate
+                        # for wrong params; it can only push a/q/G toward
+                        # satisfying the exact constraint. See conversation.
+                        J = J + self._loglik_meanfield_ode(p, phi_minor, x0_hat_frozen, dt)
+                    loss = -J
+                    opt_M.zero_grad(); loss.backward()
+                    gnorm = torch.nn.utils.clip_grad_norm_(list(self.raw.values()), max_norm=5.0)
+                    self.history_M_grad.append(gnorm.item())
+                    opt_M.step()
+                    self.history_M.append(J.item())
+            else:
+                # nothing unknown -- still record J so history_M stays meaningful
+                with torch.no_grad():
+                    p = self._param_values(detach=True)
+                    phi_minor, phi_major = self._riccati(p, track_grad=False)
+                    _, xbar_ctrl_M = self._xbar_signals(p, phi_minor, x0_hat_frozen, xbar_emp_frozen, dt)
+                    Lmaj = self._loglik_major(p, phi_major, xbar_emp_frozen, xbar_ctrl_M, xt, xtp1, dt, sig_M)
+                    Lmin = self._loglik_minor(p, phi_minor, xbar_emp_frozen, xbar_ctrl_M, x0_hat_frozen, xt, xtp1, wt_frozen, dt, sig_m)
+                    self.history_M.append((w_frozen * Lmaj + (1 - w_frozen) * Lmin).sum().item())
+
+            # --- early stop: w committed AND every unknown param stable ---
+            with torch.no_grad():
+                current_vals = {name: self._param_values(detach=True)[name].item() for name in self.raw}
+            recent_params.append(current_vals)
+            if len(recent_params) > 5:
+                recent_params.pop(0)
+            params_stable = (not self.raw) or (
+                len(recent_params) == 5 and all(
+                    (max(r[name] for r in recent_params) - min(r[name] for r in recent_params)) < 1e-3
+                    for name in self.raw
+                )
+            )
+            # monotonic confidence ratchet -- see _xbar_signals / _param_confidence.
+            self._meanfield_beta = max(
+                self._meanfield_beta, self._param_confidence(self.raw, recent_params)
+            )
+            if w_frozen.max().item() >= 0.99 and params_stable:
+                if verbose:
+                    tail = "  ".join(f"{k}={v:.4f}" for k, v in current_vals.items())
+                    print(f"  early stop at EM iter {em_iter}: max(w)={w_frozen.max().item():.4f}  {tail}")
+                break
+
+            if verbose:
+                am = torch.softmax(theta, dim=0).argmax().item()
+                tail = "  ".join(f"{k}={v:.4f}" for k, v in current_vals.items())
+                print(f"  EM iter {em_iter:3d}  J={self.history_E[-1]:.4e}  argmax={am}  {tail}")
+            if step % 10 == 0:
+                with torch.no_grad():
+                    x0_hat_full = (w.unsqueeze(1) * X).sum(dim=0)
+                self.major_snapshots.append((step, x0_hat_full.numpy()))
+            step += 1
+
+        with torch.no_grad():
+            major_prob = torch.softmax(theta, dim=0)
+            fitted = {name: self._param_values(detach=True)[name].item() for name in self.raw}
+
+        self._X, self._true_major, self._true_major_idx = X, true_major, true_major_idx
+        self.major_prob, self.fitted_params, self.n_steps_taken = major_prob, fitted, step
+        return major_prob, fitted, step
+
+    def estimated_xbar(self):
+        """
+        Mean-field trajectories at the fitted solution -- call after fit().
+        Returns (xbar_emp, xbar_mf), each a (Ndt,) numpy array aligned to xt
+        (i.e. to X[:, :-1]):
+          - xbar_emp: the fitted-w-weighted empirical mean of minor agents.
+          - xbar_mf:  the ESTIMATED mean field -- eq (4.5) self-consistently
+            solved from the fitted parameters and the fitted soft major
+            trajectory x0_hat (same construction xbar_control uses inside
+            fit(), but at the terminal/fitted params rather than a mid-
+            training blend).
+        Compare against the TRUE mean field (e.g. utility.make_example's
+        second return value -- mfg.simulate's x_bar[0], the actual eq (4.5)
+        path driven by the real major trajectory and true parameters) only
+        available in simulation studies where ground truth is known.
+        """
+        if not hasattr(self, '_X'):
+            raise RuntimeError("call fit() first")
+        dt = self.mfg.dt
+        xt = self._X[:, :-1]
+        N = self._X.shape[0] - 1
+        with torch.no_grad():
+            w = self.major_prob
+            x0_hat = (w.unsqueeze(1) * xt).sum(dim=0)
+            xbar_emp = ((1 - w).unsqueeze(1) * xt).sum(dim=0) / N
+            p = self._param_values(detach=True)
+            phi_minor, _ = self._riccati(p, track_grad=False)
+            xbar_mf = self._meanfield_xbar(p, phi_minor, x0_hat, xbar_emp[0], dt)
+        return xbar_emp.numpy(), xbar_mf.numpy()
+
+    # ------------------------------------------------------------------
+    # Diagnostics -- separated from fit() so they can be (re)plotted without
+    # re-running the optimization.
+    # ------------------------------------------------------------------
+    def plot_loss(self, path='loss_gd_em.png'):
+        fig, axes = plt.subplots(2, 1, figsize=(10, 8))
+        axes[0].plot(self.history_E)
+        axes[0].set_xlabel('E-step gradient step (cumulative)'); axes[0].set_ylabel('J')
+        axes[0].set_title('E-step loss (theta ascent, params fixed)')
+        axes[0].grid(True, alpha=0.3)
+        axes[1].plot(self.history_M, color='tab:orange')
+        axes[1].set_xlabel('M-step gradient step (cumulative)'); axes[1].set_ylabel('J')
+        axes[1].set_title('M-step loss (params ascent, w fixed)')
+        axes[1].grid(True, alpha=0.3)
+        plt.tight_layout(); plt.savefig(path, dpi=150); plt.close(fig)
+        print(f"  saved loss plot to {path}")
+
+    def plot_grad_norm(self, path='grad_norm_gd_em.png'):
+        fig, axes = plt.subplots(2, 1, figsize=(10, 8))
+        axes[0].plot(self.history_E_grad)
+        axes[0].set_xlabel('E-step gradient step (cumulative)'); axes[0].set_ylabel(r'$\|\nabla_\theta J\|$')
+        axes[0].set_title('E-step gradient norm (theta)')
+        axes[0].set_yscale('log'); axes[0].grid(True, alpha=0.3)
+        axes[1].plot(self.history_M_grad, color='tab:orange')
+        axes[1].set_xlabel('M-step gradient step (cumulative)'); axes[1].set_ylabel(r'$\|\nabla_{params} J\|$ (pre-clip)')
+        axes[1].set_title('M-step gradient norm (params)')
+        axes[1].set_yscale('log'); axes[1].grid(True, alpha=0.3)
+        plt.tight_layout(); plt.savefig(path, dpi=150); plt.close(fig)
+        print(f"  saved gradient norm plot to {path}")
+
+    def plot_trajectory(self, path='major_trajectory_gd_em.png'):
+        if not self.major_snapshots:
+            return
+        with torch.no_grad():
+            x0_hat_terminal = (self.major_prob.unsqueeze(1) * self._X).sum(dim=0).numpy()
+
+        t_axis = np.arange(self._X.shape[1])
+        fig, ax = plt.subplots(figsize=(11, 6))
+        cmap = plt.cm.viridis
+        n_snap = len(self.major_snapshots)
+        for i, (snap_step, x0_hat_snap) in enumerate(self.major_snapshots):
+            ax.plot(t_axis, x0_hat_snap, color=cmap(i / max(n_snap - 1, 1)), alpha=0.6, linewidth=1)
+
+        if self._true_major is not None:
+            ax.plot(t_axis, self._true_major.numpy(), color='black', linewidth=2.5,
+                     label=f'True major (agent {self._true_major_idx})')
+        ax.plot(t_axis, x0_hat_terminal, color='red', linewidth=2, linestyle='--',
+                 label='Terminal estimate (x0_hat)')
+
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(
+            vmin=self.major_snapshots[0][0], vmax=self.major_snapshots[-1][0]))
+        sm.set_array([])
+        fig.colorbar(sm, ax=ax, label='training step')
+        ax.set_xlabel('Time step'); ax.set_ylabel('State value')
+        ax.set_title('Major agent estimate: dynamics over training vs true')
+        ax.legend(loc='upper left'); ax.grid(True, alpha=0.3)
+        plt.tight_layout(); plt.savefig(path, dpi=150); plt.close(fig)
+        print(f"  saved major trajectory dynamics plot to {path}")
+
+
+class UObservedEstimator(MajorAgentEstimator):
+    """
+    TIER 2.5 (Case 2 from conversation): the control u_t is directly observed
+    for EVERY agent (major and minor), on top of the states X -- e.g. actual
+    borrowing/lending actions were logged, not just reserve balances. Adds a
+    THIRD, noise-free estimating equation on top of Lmaj/Lmin: the optimal
+    control laws (eq 4.1/4.3) are DETERMINISTIC given (a,q,G,phi,phi_0) and
+    the market state -- q enters them LINEARLY, unlike phi_minor's own ODE
+    where q only appears as q^2 (see conversation: that's exactly why
+    TIER-1's x-bar-only info left an exact two-fold (a,q)<->(a+2q,-q)
+    ambiguity that this does not).
+
+    Deliberately does NOT touch or subclass around MajorAgentEstimator's
+    fit() -- fit() calls self._loglik_minor(...)/self._loglik_major(...) by
+    NAME (not MajorAgentEstimator._loglik_minor(...)), so Python's normal
+    virtual dispatch means overriding just those two methods here is enough:
+    every E-step, M-step, early-stop check, and _meanfield_beta ramp in the
+    inherited fit() automatically picks up the u-based term with ZERO changes
+    to MajorAgentEstimator. That's the whole "polymorphism" trick -- fit()
+    itself is reused completely unmodified.
+    """
+
+    def __init__(self, mfg: MFG, unknown, u, u_sigma=1e-3, **kwargs):
+        super().__init__(mfg, unknown, **kwargs)
+        # u: (N+1, Ndt) observed control for EVERY agent, same row order as
+        # the X later passed to fit(), aligned to xt (one u value per
+        # transition -- same convention _loglik_major/_loglik_minor use for
+        # xt/xtp1).
+        self.u = torch.as_tensor(np.asarray(u), dtype=torch.float64)
+        # trust level for eq (4.1)/(4.3) -- NOT real noise (the control laws
+        # are exact), just how tightly to weight this against sig_M/sig_m.
+        self.u_sigma = u_sigma
+
+    def _loglik_major(self, p, phi_major, xbar_drift, xbar_control, xt, xtp1, dt, sig_M):
+        base = super()._loglik_major(p, phi_major, xbar_drift, xbar_control, xt, xtp1, dt, sig_M)
+        u_pred = (p['q_0'] - phi_major) * (xbar_control.unsqueeze(0) - xt)   # eq (4.1)
+        u_ll = dist.Normal(u_pred, self.u_sigma).log_prob(self.u).sum(dim=1)
+        return base + u_ll
+
+    def _loglik_minor(self, p, phi_minor, xbar_drift, xbar_control, x0_hat, xt, xtp1, wt, dt, sig_m):
+        base = super()._loglik_minor(p, phi_minor, xbar_drift, xbar_control, x0_hat, xt, xtp1, wt, dt, sig_m)
+        if self.leave_one_out:
+            x0_hat_i = x0_hat.unsqueeze(0) - wt * xt
+        else:
+            x0_hat_i = x0_hat.unsqueeze(0).expand_as(xt)
+        market_control = (1 - p['G']) * xbar_control.unsqueeze(0) + p['G'] * x0_hat_i
+        u_pred = (p['q'] - phi_minor) * (market_control - xt)               # eq (4.3)
+        u_ll = dist.Normal(u_pred, self.u_sigma).log_prob(self.u).sum(dim=1)
+        return base + u_ll
+
+
+# ----------------------------------------------------------------------------
+# TEMPORARY / experimental: hardcoded to unknown={'G','a','q'}, testing
+# whether reparametrizing the M-step to (a+q, q) instead of (a, q) directly
+# fixes the ridge-drift problem found in that case. Does NOT touch
+# MajorAgentEstimator or PARAM_SPECS -- self-contained, reuses the class's
+# private _riccati/_loglik_* methods via a throwaway unknown=['G','a','q']
+# instance (needed so phi/phi_0 actually re-solve as functions of the
+# current a,q; they're never read from est.raw here, a and q are tracked as
+# a separate (a_plus_q, q) pair of raw tensors instead).
+# ----------------------------------------------------------------------------
+def fit_G_a_plus_q(mfg: MFG, X, true_major_idx=None, n_em_iters=100,
+                    n_inner_E_steps=5, n_inner_M_steps=5, lr_E=0.05, lr_M=0.05,
+                    lam_entropy=0.0, leave_one_out=True, verbose=False):
+    """
+    Returns (major_prob, fitted_dict, n_steps). fitted_dict has keys
+    'G', 'a_plus_q', 'q', 'a' (a is derived: a = a_plus_q - q).
+    """
+    est = MajorAgentEstimator(mfg, unknown=['G', 'a', 'q'], leave_one_out=leave_one_out)
+    dt, Ndt = mfg.dt, mfg.Ndt
+    X = torch.as_tensor(np.asarray(X), dtype=torch.float64)
+    Np1, _ = X.shape
+    N = Np1 - 1
+
+    sig_M = mfg.sigma_0 * dt ** 0.5
+    sig_m = mfg.sigma * dt ** 0.5
+    xt, xtp1 = X[:, :-1], X[:, 1:]
+
+    theta = torch.zeros(Np1, dtype=torch.float64, requires_grad=True)
+    opt_theta = torch.optim.Adam([theta], lr=lr_E)
+
+    g_raw = torch.tensor(np.random.uniform(-1, 1), dtype=torch.float64, requires_grad=True)
+    s_raw = torch.tensor(np.random.uniform(-1, 1), dtype=torch.float64, requires_grad=True)  # a+q
+    q_raw = torch.tensor(np.random.uniform(-1, 1), dtype=torch.float64, requires_grad=True)  # q
+    opt_M = torch.optim.Adam([g_raw, s_raw, q_raw], lr=lr_M)
+
+    G_spec = PARAM_SPECS['G']
+    S_spec = _Softplus()  # a+q > 0, same reasoning as a alone previously
+
+    def current_params(detach):
+        g_, s_, q_ = (t.detach() if detach else t for t in (g_raw, s_raw, q_raw))
+        G = G_spec.to_value(g_)
+        s = S_spec.to_value(s_)
+        a = s - q_
+        return {'G': G, 'a': a, 'a_0': mfg.a_0, 'q': q_, 'q_0': mfg.q_0,
+                'epslon': mfg.epslon, 'epslon_0': mfg.epslon_0, 'c': mfg.c, 'c_0': mfg.c_0}, s, q_
+
+    history_E, history_M, recent = [], [], []
     step = 0
 
-    for em_iter in range(n_em_iters+1):
-        tau = 1.0 if not temp_anneal else max(0.3, 1.0 - step / n_steps)
-
-        # ============================= E-step ================================
-        # fix G (and its induced phi_0), take gradient-ascent steps on theta to
-        # maximize J(w | G). theta's gradient never needs G's graph, so phi_0
-        # is solved once here as a detached constant for the whole E-step.
-        with torch.no_grad():
-            G_frozen = torch.sigmoid(g_raw)
-            phi0_frozen = phi0_fixed if fix_phi0 else _solve_phi0_torch(G_frozen, phi_full, mfg)[:-1]   # (Ndt,)
+    for em_iter in range(n_em_iters + 1):
+        p_frozen, _, _ = current_params(detach=True)
+        phi_minor_f, phi_major_f = est._riccati(p_frozen, track_grad=False)
 
         for _ in range(n_inner_E_steps):
-            w = torch.softmax(theta / tau, dim=0)          # (N+1,)
-            wt = w.unsqueeze(1)                            # (N+1,1)
-            x0_hat = (wt * xt).sum(dim=0)                  # soft major traj -> (Ndt,)
-
-            xbar = ((1 - w).unsqueeze(1) * xt).sum(dim=0) / N     # (Ndt,)
-
-            Lmaj = Lmaj_of(phi0_frozen, xbar)
-            Lmin = Lmin_of(w, wt, xbar, x0_hat, G_frozen)
-
+            w = torch.softmax(theta, dim=0)
+            wt = w.unsqueeze(1)
+            x0_hat = (wt * xt).sum(dim=0)
+            xbar = ((1 - w).unsqueeze(1) * xt).sum(dim=0) / N
+            # unsplit (xbar used for both drift and control) -- this function
+            # is temporary/experimental and out of scope for the drift-vs-
+            # meanfield split, see MajorAgentEstimator.fit() for that.
+            Lmaj = est._loglik_major(p_frozen, phi_major_f, xbar, xbar, xt, xtp1, dt, sig_M)
+            Lmin = est._loglik_minor(p_frozen, phi_minor_f, xbar, xbar, x0_hat, xt, xtp1, wt, dt, sig_m)
             J = (w * Lmaj + (1 - w) * Lmin).sum()
-            H_w = -(w * torch.log(w + 1e-12)).sum()
+            H_w = -(w * torch.log(w + 1e-12)).sum() / np.log(Np1)
             loss = -(J - lam_entropy * H_w)
             opt_theta.zero_grad(); loss.backward(); opt_theta.step()
             history_E.append(J.item())
-            
 
-        # ============================= M-step ================================
-        # freeze responsibilities w, update G by gradient ascent. phi_0(G) is
-        # re-solved DIFFERENTIABLY every substep, so the backward pass carries
-        # the full total derivative of J w.r.t. G (direct, through the market
-        # mix, AND indirect, through how G reshapes the major bank's own
-        # Riccati coefficient) -- there is no closed form for this any more.
         with torch.no_grad():
             w_frozen = torch.softmax(theta, dim=0)
-            # print("frozen w:",np.sort(w_frozen.detach().numpy())[::-1][:3])
             wt_frozen = w_frozen.unsqueeze(1)
             x0_hat_frozen = (wt_frozen * xt).sum(dim=0)
             xbar_frozen = ((1 - w_frozen).unsqueeze(1) * xt).sum(dim=0) / N
 
         for _ in range(n_inner_M_steps):
-            G = torch.sigmoid(g_raw)                            # bounded to (0,1)
-            phi0 = phi0_fixed if fix_phi0 else _solve_phi0_torch(G, phi_full, mfg)[:-1]  # (Ndt,)
-
-            Lmaj = Lmaj_of(phi0, xbar_frozen)
-            Lmin = Lmin_of(w_frozen, wt_frozen, xbar_frozen, x0_hat_frozen, G)
-
+            p, s_val, q_val = current_params(detach=False)
+            phi_minor, phi_major = est._riccati(p, track_grad=True)
+            Lmaj = est._loglik_major(p, phi_major, xbar_frozen, xbar_frozen, xt, xtp1, dt, sig_M)
+            Lmin = est._loglik_minor(p, phi_minor, xbar_frozen, xbar_frozen, x0_hat_frozen, xt, xtp1, wt_frozen, dt, sig_m)
             J = (w_frozen * Lmaj + (1 - w_frozen) * Lmin).sum()
             loss = -J
-            opt_G.zero_grad(); loss.backward()
-            torch.nn.utils.clip_grad_norm_([g_raw], max_norm=5.0)
-            opt_G.step()
+            opt_M.zero_grad(); loss.backward()
+            torch.nn.utils.clip_grad_norm_([g_raw, s_raw, q_raw], max_norm=5.0)
+            opt_M.step()
             history_M.append(J.item())
-        
-        # --- early stop: w has essentially committed to one agent AND G has
-        # stopped moving -- no point burning more EM iterations past this.
-        recent_G.append(torch.sigmoid(g_raw).item())
-        if len(recent_G) > 5:
-            recent_G.pop(0)
-        if w_frozen.max().item() >= 0.99 and len(recent_G) == 5 and (max(recent_G) - min(recent_G)) < 1e-3:
-            if verbose:
-                print(f"  early stop at EM iter {em_iter}: max(w)={w_frozen.max().item():.4f}  G={recent_G[-1]:.4f}")
-            break
 
+        with torch.no_grad():
+            p_now, s_now, q_now = current_params(detach=True)
+            cur = {'G': p_now['G'].item(), 'a_plus_q': s_now.item(), 'a': s_now.item()-q_now.item(), 'q': q_now.item()}
+        recent.append(cur)
+        if len(recent) > 5:
+            recent.pop(0)
+        stable = len(recent) == 5 and all(
+            (max(r[k] for r in recent) - min(r[k] for r in recent)) < 1e-3 for k in cur
+        )
+        if w_frozen.max().item() >= 0.99 and stable:
+            if verbose:
+                print(f"  early stop at EM iter {em_iter}: max(w)={w_frozen.max().item():.4f}  {cur}")
+            break
         if verbose:
             am = torch.softmax(theta, dim=0).argmax().item()
-            print(f"  EM iter {em_iter:3d}  J={history_E[-1]:.4e}  G={torch.sigmoid(g_raw).item():.4f}  argmax={am}")
-        if step % 10 == 0:
-            with torch.no_grad():
-                x0_hat_full = (w.unsqueeze(1) * X).sum(dim=0)                     # (Ndt+1,)
-            major_snapshots.append((step, x0_hat_full.numpy()))
+            print(f"  EM iter {em_iter:3d}  J={history_E[-1]:.4e}  argmax={am}  {cur}")
         step += 1
-    with torch.no_grad():
-        major_prob = torch.softmax(theta, dim=0)
-
-    if verbose:
-        fig, axes = plt.subplots(2, 1, figsize=(10, 8))
-        axes[0].plot(history_E)
-        axes[0].set_xlabel('E-step gradient step (cumulative)'); axes[0].set_ylabel('J')
-        axes[0].set_title('E-step loss (theta ascent, G fixed)')
-        axes[0].grid(True, alpha=0.3)
-        axes[1].plot(history_M, color='tab:orange')
-        axes[1].set_xlabel('M-step gradient step (cumulative)'); axes[1].set_ylabel('J')
-        axes[1].set_title('M-step loss (G ascent, w fixed)')
-        axes[1].grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.savefig('loss_detect_major_G.png', dpi=150)
-        plt.close(fig)
-        print("  saved loss plot to loss_detect_major_G.png")
-
-        # --- one combined plot: how x0_hat evolved toward the true major -----
-        if major_snapshots:
-            with torch.no_grad():
-                x0_hat_terminal = (major_prob.unsqueeze(1) * X).sum(dim=0).numpy()
-
-            t_axis = np.arange(X.shape[1])
-            fig, ax = plt.subplots(figsize=(11, 6))
-
-            cmap = plt.cm.viridis
-            n_snap = len(major_snapshots)
-            for i, (snap_step, x0_hat_snap) in enumerate(major_snapshots):
-                color = cmap(i / max(n_snap - 1, 1))
-                ax.plot(t_axis, x0_hat_snap, color=color, alpha=0.6, linewidth=1)
-
-            ax.plot(t_axis, true_major.numpy(), color='black', linewidth=2.5,
-                     label=f'True major (agent {true_major_idx})')
-            ax.plot(t_axis, x0_hat_terminal, color='red', linewidth=2, linestyle='--',
-                     label='Terminal estimate (x0_hat)')
-
-            sm = plt.cm.ScalarMappable(cmap=cmap,
-                                        norm=plt.Normalize(vmin=major_snapshots[0][0], vmax=major_snapshots[-1][0]))
-            sm.set_array([])
-            fig.colorbar(sm, ax=ax, label='training step')
-
-            ax.set_xlabel('Time step'); ax.set_ylabel('State value')
-            ax.set_title('Major agent estimate: dynamics over training vs true')
-            ax.legend(loc='upper left'); ax.grid(True, alpha=0.3)
-            plt.tight_layout()
-            plt.savefig('major_trajectory_dynamics.png', dpi=150)
-            plt.close(fig)
-            print("  saved major trajectory dynamics plot to major_trajectory_dynamics.png")
-
-    return major_prob, torch.sigmoid(g_raw).detach(),step
-
-
-# ----------------------------------------------------------------------------
-# Same EM scheme, but the M-step solves for G in CLOSED FORM (not gradient).
-# ----------------------------------------------------------------------------
-def detect_major_G_closedform(mfg: MFG, X,true_major_idx:int, 
-                               n_em_iters=50, n_inner_E_steps=20, lr_E=0.05,
-                               leave_one_out=True, temp_anneal=False,
-                               init_theta=None, verbose=False, lam_entropy=0.0,
-                               recalc_phi0=False):
-    """
-    Same E-step as detect_major_G (gradient ascent on theta, G held fixed).
-    The M-step, however, solves for G in CLOSED FORM instead of by gradient
-    ascent -- this is only valid because phi_0 is treated as G-FREE here
-    (taken once from mfg.solve_ODE(), never re-solved; equivalent to
-    detect_major_G(..., fix_phi0=True)). With phi_0 fixed, ell_major has no
-    G-dependence at all, and mu_minor_i(t) = c_i(t) + G*d_i(t) is exactly
-    affine in G, so the weighted Gaussian log-likelihood is quadratic in G and
-    its maximizer (for the current, frozen w) is the ordinary weighted
-    least-squares solution:
-
-        G* = sum_{i,t} (1-w_i) * d_i(t) * e_i(t)  /  sum_{i,t} (1-w_i) * d_i(t)^2
-
-    where c_i(t) = mu_minor_i(t) at G=0, d_i(t) = d(mu_minor_i(t))/dG, and
-    e_i(t) = x_i(t+1) - c_i(t). No sigmoid/bounding is needed for G here: unlike
-    detect_major_G's fix_phi0=False path, G never feeds a numerically-touchy
-    ODE recursion in this function -- it only ever appears in the affine
-    market-mixing term, which is smooth and well-defined for any real G.
-
-    mfg, X, x_bar_obs, n_em_iters, n_inner_E_steps, lr_E, leave_one_out,
-    temp_anneal, init_theta, verbose : same meaning as in detect_major_G.
-    true_major_idx : DEBUG ONLY -- index of the actual major agent in X (known
-                  because this is synthetic data from make_example). Not used
-                  by the estimator itself (no ground-truth leakage into theta
-                  or G); only used, when verbose=True, to overlay the true
-                  major trajectory and the true (or data-only-estimated) mean
-                  field against the model's own estimates in a saved debug
-                  plot ('mean_field_and_major_debug.png').
-    lam_entropy : coefficient on an ENTROPY PENALTY added to the E-step's
-                  objective: maximize J(w|G) - lam_entropy*H(w), where
-                  H(w) = -sum_i w_i*log(w_i). This is the opposite sign from
-                  the usual variational-EM entropy BONUS (which guards against
-                  w collapsing artificially): here w is instead pulled toward
-                  HIGH entropy (flat) by a genuine ridge in the likelihood --
-                  ell_minor depends on (G, w) almost only through the product
-                  G*max(w), so ell_major can gain "for free" by spreading
-                  weight onto agents that look major-like by pure sampling
-                  noise, financed by a compensating rise in G. Subtracting
-                  entropy (entropy MINIMIZATION, as in Grandvalet-Bengio
-                  self-training) directly counteracts that free-lunch
-                  direction. Only affects the E-step -- H(w) doesn't depend on
-                  G, so the M-step's closed-form solve is unchanged.
-    recalc_phi0 : if True, phi_0 is NOT left at mfg.solve_ODE()'s value (which
-                  was solved at mfg's own, TRUE G -- information the estimator
-                  shouldn't really have if G is genuinely unknown). Instead,
-                  at the start of every EM iteration, phi_0 is RE-SOLVED at the
-                  CURRENT G estimate (plain non-differentiable backward-Euler,
-                  no_grad -- the closed-form M-step still treats phi_0/ell_major
-                  as G-free WITHIN that iteration's own G* solve; only the
-                  snapshot itself is refreshed between iterations, the same
-                  "solve equilibrium at current parameter, then treat it as
-                  fixed for this round" pattern as detect_major_G's E-step).
-                  This makes ell_major genuinely (iteration-to-iteration)
-                  track the evolving G estimate instead of secretly assuming
-                  the true one throughout. If False (default), phi_0 is fixed
-                  once at mfg's true G for the whole run, as before.
-    returns : (major_prob (N+1,) tensor, G (scalar tensor), history list of J values)
-    """
-    dt = mfg.dt
-    X  = torch.as_tensor(np.asarray(X), dtype=torch.float64)
-    Np1, _ = X.shape
-    N = Np1 - 1
-    true_major = X[true_major_idx]
-
-    phi_full = torch.as_tensor(mfg.phi, dtype=torch.float64)   # (Ndt+1,)
-    phi = phi_full[:-1]                                        # (Ndt,)
-    phi0_fixed = torch.as_tensor(mfg.phi_0[:-1], dtype=torch.float64)  # (Ndt,), G-free
-
-    sig_M = mfg.sigma_0 * dt**0.5
-    sig_m = mfg.sigma   * dt**0.5
-
-    a, q = mfg.a, mfg.q
-    a0, q0 = mfg.a_0, mfg.q_0
-    k = (a + (q - phi)) * dt          # (Ndt,) minor drift coefficient, G-independent
-
-    xt   = X[:, :-1]    # (N+1, Ndt)
-    xtp1 = X[:, 1:]     # (N+1, Ndt)
-
-    theta = (torch.zeros(Np1, dtype=torch.float64) if init_theta is None
-             else torch.as_tensor(init_theta, dtype=torch.float64).clone())
-    theta.requires_grad_(True)
-    opt_theta = torch.optim.Adam([theta], lr=lr_E)
-
-    G = torch.as_tensor(np.random.uniform(0, 1), dtype=torch.float64)
-
-    history = []      # E-step J trace (one point per theta gradient step)
-    history_M = []    # M-step J trace (one point per EM iteration -- closed-form solve, no inner loop)
-    recent_G = []     # rolling window of G, for the early-stop check below
-    n_steps = n_em_iters * n_inner_E_steps
-    step = 0
-
-    for em_iter in range(n_em_iters):
-        tau = 1.0 if not temp_anneal else max(0.3, 1.0 - step / n_steps)
-
-        if recalc_phi0:
-            # re-solve phi_0 at the CURRENT G estimate (not mfg's true G),
-            # plain/non-differentiable -- treated as fixed for this iteration.
-            with torch.no_grad():
-                phi0_fixed = _solve_phi0_torch(G, phi_full, mfg)[:-1]
-                
-        # ============================= E-step ================================
-        # fix G, take gradient-ascent steps on theta to maximize J(w | G).
-        for _ in range(n_inner_E_steps):
-            w = torch.softmax(theta / tau, dim=0)          # (N+1,)
-            wt = w.unsqueeze(1)                            # (N+1,1)
-            x0_hat = (wt * xt).sum(dim=0)                  # soft major traj -> (Ndt,)
-
-            xbar = ((1 - w).unsqueeze(1) * xt).sum(dim=0) / N     # (Ndt,)
-            mu_major = xt + (a0 + (q0 - phi0_fixed)) * (xbar.unsqueeze(0) - xt) * dt
-            Lmaj = dist.Normal(mu_major, sig_M).log_prob(xtp1).sum(dim=1)
-
-            if leave_one_out:
-                x0_hat_i = x0_hat.unsqueeze(0) - wt * xt            # (N+1,Ndt)
-            else:
-                x0_hat_i = x0_hat.unsqueeze(0).expand_as(xt)        # (N+1,Ndt)
-            market_i = (1 - G) * xbar.unsqueeze(0) + G * x0_hat_i    # (N+1,Ndt)
-            mu_minor = xt + k * (market_i - xt)                      # (N+1,Ndt)
-            Lmin = dist.Normal(mu_minor, sig_m).log_prob(xtp1).sum(dim=1)  # (N+1,)
-
-            J = (w * Lmaj + (1 - w) * Lmin).sum()
-            # entropy MINIMIZATION penalty (opposite sign from the usual ELBO
-            # entropy bonus): counteracts the ell_major-driven ridge that
-            # otherwise rewards flattening w -- see docstring.
-            H_w = -(w * torch.log(w + 1e-12)).sum()
-            loss = -(J - lam_entropy * H_w)
-            opt_theta.zero_grad(); loss.backward(); opt_theta.step()
-            history.append(J.item())
-            step += 1
-
-        # ============================= M-step (closed form) ==================
-        # freeze responsibilities w, solve for G exactly via weighted least
-        # squares -- see docstring for the derivation.
-        with torch.no_grad():
-            w = torch.softmax(theta, dim=0)
-            wt = w.unsqueeze(1)
-            x0_hat = (wt * xt).sum(dim=0)
-
-            xbar = ((1 - w).unsqueeze(1) * xt).sum(dim=0) / N
-
-            if leave_one_out:
-                x0_hat_i = x0_hat.unsqueeze(0) - wt * xt
-            else:
-                x0_hat_i = x0_hat.unsqueeze(0).expand_as(xt)
-
-            c_i = xt + k * (xbar.unsqueeze(0) - xt)           # mu_minor at G=0     (N+1,Ndt)
-            d_i = k * (x0_hat_i - xbar.unsqueeze(0))          # d(mu_minor)/dG      (N+1,Ndt)
-            e_i = xtp1 - c_i                                  # residual at G=0     (N+1,Ndt)
-
-            weights = (1 - w).unsqueeze(1)                    # (N+1,1) minor responsibility
-
-            num = (weights * d_i * e_i).sum()
-            den = (weights * d_i * d_i).sum()
-            if den.abs() > 1e-12:
-                # G is a mixing weight (F=1-G), only physically meaningful in
-                # [0,1]. J(G) is concave quadratic, so clamping the unconstrained
-                # optimum to [0,1] is the EXACT box-constrained maximizer, not a
-                # heuristic: if num/den lies outside [0,1], J is monotonic
-                # between it and the interval, so the nearest endpoint is where
-                # the constrained maximum is attained.
-                G = torch.clamp(num / den, 0.0, 1.0)
-
-            # M-step J, evaluated at the freshly-solved G, for the loss plot
-            mu_minor_new = c_i + G * d_i
-            Lmin_new = dist.Normal(mu_minor_new, sig_m).log_prob(xtp1).sum(dim=1)
-            Lmaj_new = dist.Normal(
-                xt + (a0 + (q0 - phi0_fixed)) * (xbar.unsqueeze(0) - xt) * dt, sig_M
-            ).log_prob(xtp1).sum(dim=1)
-            J_M = (w * Lmaj_new + (1 - w) * Lmin_new).sum()
-            history_M.append(J_M.item())
-
-        # --- early stop: w has essentially committed to one agent AND G has
-        # stopped moving -- no point burning more EM iterations past this.
-        recent_G.append(G.item())
-        if len(recent_G) > 5:
-            recent_G.pop(0)
-        if w.max().item() >= 0.99 and len(recent_G) == 5 and (max(recent_G) - min(recent_G)) < 1e-3:
-            if verbose:
-                print(f"  early stop at EM iter {em_iter}: max(w)={w.max().item():.4f}  G={recent_G[-1]:.4f}")
-            break
-
-        if verbose:
-            am = w.argmax().item()   # w here is the M-step's frozen snapshot, already computed above
-            print(f"  EM iter {em_iter:3d}  J={history[-1]:.4e}  G={G.item():.4f}  argmax={am}")
-
-            with torch.no_grad():
-                x0_hat_full = (w.unsqueeze(1) * X).sum(dim=0)                     # (Ndt+1,)
-
-            t_axis = np.arange(X.shape[1])
-            fig, ax = plt.subplots(figsize=(10, 5))
-            ax.plot(t_axis, true_major.numpy(), 'o-', label=f'True major (agent {true_major_idx})', linewidth=2, markersize=3)
-            ax.plot(t_axis, x0_hat_full.numpy(), 's--', label='Estimated soft major (x0_hat)', linewidth=2, markersize=3)
-            ax.set_xlabel('Time step'); ax.set_ylabel('State value')
-            ax.set_title(f'Major agent: true vs estimated  (argmax={am}, max(w)={w.max().item():.3f}, G={G.item():.4f})')
-            ax.legend(); ax.grid(True, alpha=0.3)
-
-            plt.tight_layout()
-            plt.savefig(f'debug_iter_{em_iter:03d}.png', dpi=150)
-            plt.close(fig)
 
     with torch.no_grad():
         major_prob = torch.softmax(theta, dim=0)
+        p_final, s_final, q_final = current_params(detach=True)
+        fitted = {'G': p_final['G'].item(), 'a_plus_q': s_final.item(),
+                  'q': q_final.item(), 'a': p_final['a'].item()}
 
-    if verbose:
-        fig, axes = plt.subplots(2, 1, figsize=(10, 8))
-        axes[0].plot(history)
-        axes[0].set_xlabel('E-step gradient step (cumulative)'); axes[0].set_ylabel('J')
-        axes[0].set_title('E-step loss (theta ascent, G fixed)')
-        axes[0].grid(True, alpha=0.3)
-        axes[1].plot(history_M, color='tab:orange', marker='o', markersize=3)
-        axes[1].set_xlabel('EM iteration'); axes[1].set_ylabel('J')
-        axes[1].set_title('M-step loss (closed-form G solve, w fixed)')
-        axes[1].grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.savefig('loss_detect_major_G_closedform.png', dpi=150)
-        plt.close(fig)
-        print("  saved loss plot to loss_detect_major_G_closedform.png")
-
-    return major_prob, G, history
-
-
-# # ----------------------------------------------------------------------------
-# # Baseline: fixed-score gap argmax (enumeration's per-agent likelihood ratio)
-# # ----------------------------------------------------------------------------
-# def detect_major_gap(mfg, X, x_bar_obs):
-#     """
-#     Closed-form baseline. Scores each agent as major-vs-minor using the OBSERVED
-#     mean field for the major reference and F*xbar+G*xbar as a w-free market proxy.
-#     Returns (major_prob = softmax(gap), gap (N+1,), argmax index).
-#     """
-#     dt = mfg.dt
-#     X  = torch.as_tensor(np.asarray(X), dtype=torch.float64)
-#     Np1, _ = X.shape
-#     phi   = torch.as_tensor(mfg.phi[:-1],   dtype=torch.float64)
-#     phi_0 = torch.as_tensor(mfg.phi_0[:-1], dtype=torch.float64)
-#     sig_M = mfg.sigma_0 * dt**0.5
-#     sig_m = mfg.sigma   * dt**0.5
-#     F, G  = mfg.F, mfg.G
-#     a, q, a0, q0 = mfg.a, mfg.q, mfg.a_0, mfg.q_0
-
-#     xt, xtp1 = X[:, :-1], X[:, 1:]
-#     xbar = torch.as_tensor(np.asarray(x_bar_obs), dtype=torch.float64)[:-1]
-
-#     mu_major = xt + (a0 + (q0 - phi_0)) * (xbar.unsqueeze(0) - xt) * dt
-#     Lmaj = dist.Normal(mu_major, sig_M).log_prob(xtp1).sum(dim=1)
-
-#     market = (1 - G) * xbar + G * x0_hat_loo                       # w-free proxy
-#     mu_minor = xt + (a + (q - phi)) * (market.unsqueeze(0) - xt) * dt
-#     Lmin = dist.Normal(mu_minor, sig_m).log_prob(xtp1).sum(dim=1)
-
-#     gap = Lmaj - Lmin
-#     return torch.softmax(gap, dim=0), gap, int(gap.argmax().item())
-
-
-# ----------------------------------------------------------------------------
-# Helper: simulate one system, stack, permute (kill positional label leakage)
-# ----------------------------------------------------------------------------
-def make_example(mfg: MFG, N: int, seed=None):
-    if seed is not None:
-        np.random.seed(seed)
-    x_bar, x_major, x_minor = mfg.simulate(N=N, N_sim=1, do_plot=False)
-    # stack major as row 0, then minors
-    X_ordered = np.vstack([x_major[0:1, :], x_minor[0, :, :]])   # (N+1, Ndt+1)
-    perm = np.random.permutation(N + 1)
-    X = X_ordered[perm]
-    true_idx = int(np.where(perm == 0)[0][0])                    # where major landed
-    return X, x_bar[0], true_idx                                # x_bar[0]: (Ndt+1,)
+    return major_prob, fitted, step
 
 
 # ----------------------------------------------------------------------------
@@ -607,35 +850,12 @@ if __name__ == "__main__":
     N = 20
     X, x_bar_obs, true_idx = make_example(mfg, N, seed=0)
 
-    print("=== EM relaxation (Tier 2, observed mean field, G unknown) ===")
-    prob, G_hat, hist = detect_major_G(mfg, X, x_bar_obs, verbose=True)
+    print("=== MajorAgentEstimator: G unknown, a/a_0/q/q_0/epslon known ===")
+    est = MajorAgentEstimator(mfg, unknown=['G'], lam_entropy=20.0)
+    prob, fitted, n_steps = est.fit(X, true_major_idx=true_idx, n_em_iters=100,
+                                     n_inner_E_steps=5, n_inner_M_steps=5, verbose=True)
     pred = int(prob.argmax().item())
     print(f"predicted={pred}  true={true_idx}  correct={pred==true_idx}  "
-          f"G_hat={G_hat.item():.4f}  G_true={cfg.G}")
+          f"fitted={fitted}  G_true={cfg.G}")
     print("top-3 prob:", np.round(np.sort(prob.numpy())[::-1][:3], 3))
-
-    print("\n=== EM relaxation (Tier 3, mean field unobserved -- estimated from X) ===")
-    prob3, G_hat3, hist3 = detect_major_G(mfg, X, x_bar_obs=None, verbose=True)
-    pred3 = int(prob3.argmax().item())
-    print(f"predicted={pred3}  true={true_idx}  correct={pred3==true_idx}  "
-          f"G_hat={G_hat3.item():.4f}  G_true={cfg.G}")
-    print("top-3 prob:", np.round(np.sort(prob3.numpy())[::-1][:3], 3))
-
-    # print("\n=== Gap-argmax baseline ===")
-    # pb, gap, pred_b = detect_major_gap(mfg, X, x_bar_obs)
-    # print(f"predicted={pred_b}  true={true_idx}  correct={pred_b==true_idx}")
-
-    # # quick accuracy over seeds
-    # print("\n=== Accuracy over 50 seeds ===")
-    # nc_relax = nc_relax3 = nc_gap = 0
-    # for s in range(50):
-    #     Xs, xbs, ti = make_example(mfg, N, seed=100 + s)
-    #     p,  _ = detect_major_relaxed(mfg, Xs, xbs,        n_steps=400, verbose=False)
-    #     p3, _ = detect_major_relaxed(mfg, Xs, x_bar_obs=None, n_steps=400, verbose=False)
-    #     _, _, pg = detect_major_gap(mfg, Xs, xbs)
-    #     nc_relax  += (int(p.argmax())  == ti)
-    #     nc_relax3 += (int(p3.argmax()) == ti)
-    #     nc_gap    += (pg == ti)
-    # print(f"relaxation (observed xbar): {nc_relax}/50   "
-    #       f"relaxation (estimated xbar): {nc_relax3}/50   "
-    #       f"gap-baseline: {nc_gap}/50")
+    est.plot_loss(); est.plot_grad_norm(); est.plot_trajectory()

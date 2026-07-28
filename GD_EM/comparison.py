@@ -12,7 +12,8 @@ Writes three plain-text tables: comparison_G.txt, comparison_N.txt, comparison_l
 
 import numpy as np
 from mfg import MFG, MFG_config
-from solver import make_example, detect_major_G
+from solver import MajorAgentEstimator
+from utility import make_example
 
 # --- baseline config (paper Section 6 / Fig B.5-B.6 regime) -----------------
 A        = 5
@@ -82,12 +83,13 @@ def sweep_G(G_true_values, n_seeds=N_SEEDS):
         for seed in range(n_seeds):
             print(f"  [G sweep] G_true={G_true}  seed={seed}", end="\r")
             X, x_bar_obs, true_idx = make_example(mfg, N_BASE, seed=seed)
-            prob, G_hat, step = detect_major_G(
-                mfg, X, true_idx,
+            est = MajorAgentEstimator(mfg, unknown=['G'], lam_entropy=LAM_BASE)
+            prob, fitted, step = est.fit(
+                X, true_major_idx=true_idx,
                 n_em_iters=N_EM_ITERS, n_inner_E_steps=N_INNER_E_STEPS,
-                n_inner_M_steps=N_INNER_M_STEPS, lam_entropy=LAM_BASE, verbose=False,
+                n_inner_M_steps=N_INNER_M_STEPS, verbose=False,
             )
-            G_hats.append(G_hat.item())
+            G_hats.append(fitted['G'])
             correct_flags.append(int(prob.argmax()) == true_idx)
             steps.append(step)
         row = {"G_true": G_true, "n_seeds": n_seeds, **summarize(G_hats, correct_flags, steps, G_true)}
@@ -107,12 +109,13 @@ def sweep_N(N_values, n_seeds=N_SEEDS):
         for seed in range(n_seeds):
             print(f"  [N sweep] N={N}  seed={seed}", end="\r")
             X, x_bar_obs, true_idx = make_example(mfg, N, seed=seed)
-            prob, G_hat, step = detect_major_G(
-                mfg, X, true_idx,fix_phi0=False,
+            est = MajorAgentEstimator(mfg, unknown=['G'], lam_entropy=LAM_BASE)
+            prob, fitted, step = est.fit(
+                X, true_major_idx=true_idx,
                 n_em_iters=N_EM_ITERS, n_inner_E_steps=N_INNER_E_STEPS,
-                n_inner_M_steps=N_INNER_M_STEPS, lam_entropy=LAM_BASE, verbose=False,
+                n_inner_M_steps=N_INNER_M_STEPS, verbose=False,
             )
-            G_hats.append(G_hat.item())
+            G_hats.append(fitted['G'])
             correct_flags.append(int(prob.argmax()) == true_idx)
             steps.append(step)
         row = {"N": N, "n_seeds": n_seeds, **summarize(G_hats, correct_flags, steps, G_TRUE_BASE)}
@@ -134,12 +137,13 @@ def sweep_lambda(lam_values, n_seeds=N_SEEDS):
         X, x_bar_obs, true_idx = make_example(mfg, N_BASE, seed=seed)
         for lam in lam_values:
             print(f"  [lambda sweep] lam={lam}  seed={seed}", end="\r")
-            prob, G_hat, step = detect_major_G(
-                mfg, X, true_idx,
+            est = MajorAgentEstimator(mfg, unknown=['G'], lam_entropy=lam)
+            prob, fitted, step = est.fit(
+                X, true_major_idx=true_idx,
                 n_em_iters=N_EM_ITERS, n_inner_E_steps=N_INNER_E_STEPS,
-                n_inner_M_steps=N_INNER_M_STEPS, lam_entropy=lam, verbose=False,
+                n_inner_M_steps=N_INNER_M_STEPS, verbose=False,
             )
-            per_lam[lam]["G_hats"].append(G_hat.item())
+            per_lam[lam]["G_hats"].append(fitted['G'])
             per_lam[lam]["correct_flags"].append(int(prob.argmax()) == true_idx)
             per_lam[lam]["steps"].append(step)
 
