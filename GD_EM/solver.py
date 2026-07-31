@@ -191,7 +191,7 @@ class MajorAgentEstimator:
 
     def __init__(self, mfg: MFG, unknown, lr_E=0.05, lr_M=0.05, lam_entropy=0.0,
                  leave_one_out=True, temp_anneal=False, init=None, observed_xbar=None,
-                 ode_sigma=1e-3):
+                 ode_sigma=1e-3, lr_decay=1.0):
         self.mfg = mfg
         # TIER-1 hook: if the true mean-field trajectory is directly observed
         # (e.g. utility.make_example's 2nd return value, x_bar[0] from
@@ -225,6 +225,15 @@ class MajorAgentEstimator:
                 raise ValueError(f"unknown parameter {name!r} has no registered transform in PARAM_SPECS")
 
         self.lr_E, self.lr_M = lr_E, lr_M
+        # plain multiplicative decay applied to BOTH opt_theta and opt_M,
+        # once per em_iter (not per inner step) -- default 1.0 is a no-op,
+        # preserving old behavior. See conversation: near a sharp optimum (as
+        # UObservedEstimator's u-term produces once beta~1), a constant lr
+        # can overshoot and oscillate around the peak forever instead of
+        # settling, which starves params_stable of ever firing. Decaying the
+        # step size lets Adam actually converge onto a sharp optimum instead
+        # of orbiting it.
+        self.lr_decay = lr_decay
         self.lam_entropy = lam_entropy
         self.leave_one_out = leave_one_out
         self.temp_anneal = temp_anneal
@@ -431,6 +440,10 @@ class MajorAgentEstimator:
         theta.requires_grad_(True)
         opt_theta = torch.optim.Adam([theta], lr=self.lr_E)
         opt_M = torch.optim.Adam(list(self.raw.values()), lr=self.lr_M) if self.raw else None
+        # plain per-em_iter multiplicative decay, gamma=1.0 is a no-op.
+        sched_theta = torch.optim.lr_scheduler.ExponentialLR(opt_theta, gamma=self.lr_decay)
+        sched_M = (torch.optim.lr_scheduler.ExponentialLR(opt_M, gamma=self.lr_decay)
+                   if opt_M is not None else None)
 
         recent_params = []
         n_steps = n_em_iters * n_inner_E_steps
@@ -517,6 +530,10 @@ class MajorAgentEstimator:
                     Lmin = self._loglik_minor(p, phi_minor, xbar_emp_frozen, xbar_ctrl_M, x0_hat_frozen, xt, xtp1, wt_frozen, dt, sig_m)
                     self.history_M.append((w_frozen * Lmaj + (1 - w_frozen) * Lmin).sum().item())
 
+            sched_theta.step()
+            if sched_M is not None:
+                sched_M.step()
+
             # --- early stop: w committed AND every unknown param stable ---
             with torch.no_grad():
                 current_vals = {name: self._param_values(detach=True)[name].item() for name in self.raw}
@@ -533,16 +550,16 @@ class MajorAgentEstimator:
             self._meanfield_beta = max(
                 self._meanfield_beta, self._param_confidence(self.raw, recent_params)
             )
-            if w_frozen.max().item() >= 0.99 and params_stable:
+            if w_frozen.max().item() >= 0.98 and params_stable:
                 if verbose:
                     tail = "  ".join(f"{k}={v:.4f}" for k, v in current_vals.items())
-                    print(f"  early stop at EM iter {em_iter}: max(w)={w_frozen.max().item():.4f}  {tail}")
+                    print(f"  early stop at EM iter {em_iter}: max(w)={w_frozen.max().item():.4f}  {tail} beta={self._meanfield_beta:.3f}")
                 break
 
             if verbose:
                 am = torch.softmax(theta, dim=0).argmax().item()
                 tail = "  ".join(f"{k}={v:.4f}" for k, v in current_vals.items())
-                print(f"  EM iter {em_iter:3d}  J={self.history_E[-1]:.4e}  argmax={am}  {tail}")
+                print(f"  EM iter {em_iter:3d}  J={self.history_E[-1]:.4e}  argmax={am}  {tail} beta={self._meanfield_beta:.3f}")
             if step % 10 == 0:
                 with torch.no_grad():
                     x0_hat_full = (w.unsqueeze(1) * X).sum(dim=0)
@@ -669,21 +686,39 @@ class UObservedEstimator(MajorAgentEstimator):
     itself is reused completely unmodified.
     """
 
-    def __init__(self, mfg: MFG, unknown, u, u_sigma=1e-3, **kwargs):
+    def __init__(self, mfg: MFG, unknown, u, u_sigma=1e-3, u_sigma_loose=0.3, **kwargs):
         super().__init__(mfg, unknown, **kwargs)
-        # u: (N+1, Ndt) observed control for EVERY agent, same row order as
-        # the X later passed to fit(), aligned to xt (one u value per
-        # transition -- same convention _loglik_major/_loglik_minor use for
-        # xt/xtp1).
+        # u: (N+1, Ndt+1) observed control for EVERY agent, same row order and
+        # full length as the X later passed to fit() -- NOT pre-sliced. Index
+        # 0 is always 0/unset (mfg.py's simulate() loop only ever writes
+        # u[:, i+1], computed FROM the state at index i), so the value that
+        # actually corresponds to xt[:, k] (state at index k) lives at
+        # u[:, k+1], not u[:, k] -- sliced as self.u[:, 1:] below, mirroring
+        # xtp1 = X[:, 1:]'s alignment, NOT xt = X[:, :-1]'s.
         self.u = torch.as_tensor(np.asarray(u), dtype=torch.float64)
-        # trust level for eq (4.1)/(4.3) -- NOT real noise (the control laws
-        # are exact), just how tightly to weight this against sig_M/sig_m.
+        # eq (4.1)/(4.3) are exact given the TRUE xbar_control -- but when
+        # xbar isn't observed, xbar_control is itself only an approximation
+        # (xbar_emp early, the self-consistent eq (4.5) solve once beta
+        # ramps -- see _xbar_signals), so comparing u against a prediction
+        # built on that approximation has a real, a-independent residual
+        # floor even at the true params. u_sigma=1e-3 (appropriate once
+        # xbar_control is trustworthy) blows that floor up into a dominant,
+        # misleading gradient early on -- see conversation. So the EFFECTIVE
+        # sigma tracks the same self._meanfield_beta confidence ramp already
+        # driving xbar_control: loose (u_sigma_loose) while beta~0, tightening
+        # to u_sigma (tight) as beta->1, rather than a second, disconnected
+        # hyperparameter to hand-tune.
         self.u_sigma = u_sigma
+        self.u_sigma_loose = u_sigma_loose
+
+    def _u_sigma_eff(self):
+        beta = self._meanfield_beta
+        return self.u_sigma_loose * (1 - beta) + self.u_sigma * beta
 
     def _loglik_major(self, p, phi_major, xbar_drift, xbar_control, xt, xtp1, dt, sig_M):
         base = super()._loglik_major(p, phi_major, xbar_drift, xbar_control, xt, xtp1, dt, sig_M)
         u_pred = (p['q_0'] - phi_major) * (xbar_control.unsqueeze(0) - xt)   # eq (4.1)
-        u_ll = dist.Normal(u_pred, self.u_sigma).log_prob(self.u).sum(dim=1)
+        u_ll = dist.Normal(u_pred, self._u_sigma_eff()).log_prob(self.u[:, 1:]).sum(dim=1)
         return base + u_ll
 
     def _loglik_minor(self, p, phi_minor, xbar_drift, xbar_control, x0_hat, xt, xtp1, wt, dt, sig_m):
@@ -694,7 +729,7 @@ class UObservedEstimator(MajorAgentEstimator):
             x0_hat_i = x0_hat.unsqueeze(0).expand_as(xt)
         market_control = (1 - p['G']) * xbar_control.unsqueeze(0) + p['G'] * x0_hat_i
         u_pred = (p['q'] - phi_minor) * (market_control - xt)               # eq (4.3)
-        u_ll = dist.Normal(u_pred, self.u_sigma).log_prob(self.u).sum(dim=1)
+        u_ll = dist.Normal(u_pred, self._u_sigma_eff()).log_prob(self.u[:, 1:]).sum(dim=1)
         return base + u_ll
 
 

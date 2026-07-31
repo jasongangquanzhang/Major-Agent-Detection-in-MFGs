@@ -150,7 +150,7 @@ def run_config(config_id, n_seeds=N_SEEDS):
             if seed in done:
                 continue
             t0 = time.time()
-            X, x_bar_obs, true_idx = make_example(mfg, N_BASE, seed=seed)
+            X, x_bar_obs, true_idx,_ = make_example(mfg, N_BASE, seed=seed)
             est = MajorAgentEstimator(mfg, unknown=unknown, lam_entropy=LAM_ENTROPY,
                                        lr_E=0.05, lr_M=0.05)
             prob, fitted, n_steps = est.fit(

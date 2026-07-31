@@ -133,20 +133,22 @@ class MFG:
             + self.sigma * np.sqrt(self.dt) * np.random.randn(*x_minor.shape)
         )                                                                    # (N_sim, N)
 
-        return x_bar_next, x_major_next, x_minor_next
+        return x_bar_next, x_major_next, x_minor_next,u_major,u_minor
 
     def simulate(self, N, N_sim, do_plot=True):
         self.solve_ODE()
         x_bar = np.zeros((N_sim, self.Ndt + 1))        # (N_sim, Ndt+1)
         x_major = np.zeros((N_sim, self.Ndt + 1))      # (N_sim, Ndt+1)
         x_minor = np.zeros((N_sim, N, self.Ndt + 1))   # (N_sim, N, Ndt+1)
+        u_major = np.zeros((N_sim, self.Ndt + 1))      # (N_sim, Ndt+1)
+        u_minor = np.zeros((N_sim, N, self.Ndt + 1))   # (N_sim, N, Ndt+1)
         for i in range(self.Ndt):
-            x_bar[:, i + 1], x_major[:, i + 1], x_minor[:, :, i + 1] = (
+            x_bar[:, i + 1], x_major[:, i + 1], x_minor[:, :, i + 1], u_major[:, i + 1], u_minor[:, :, i + 1] = (
                 self.state_transtition(i, x_bar[:, i], x_major[:, i], x_minor[:, :, i])
             )
         if do_plot:
             self.plot(x_bar, x_major, x_minor)
-        return x_bar, x_major, x_minor
+        return x_bar, x_major, x_minor, u_major, u_minor
 
     def plot(self, x_bar, x_major, x_minor):
         D      = -0.65
