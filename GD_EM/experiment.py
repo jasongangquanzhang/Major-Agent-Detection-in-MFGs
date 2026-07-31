@@ -107,12 +107,19 @@ def make_mfg(G_true):
     return mfg
 
 
+def _ensure_parent_dir(path):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    return path
+
+
 def result_path(stage_idx, stage_name, G_true):
-    return f"result_7_31/results_stage{stage_idx}_{stage_name}_Gtrue{G_true}.csv"
+    return _ensure_parent_dir(f"result_7_31/results_stage{stage_idx}_{stage_name}_Gtrue{G_true}.csv")
 
 
 def result_path_u(stage_idx, stage_name, G_true):
-    return f"result_7_31/results_u_stage{stage_idx}_{stage_name}_Gtrue{G_true}.csv"
+    return _ensure_parent_dir(f"result_7_31/results_u_stage{stage_idx}_{stage_name}_Gtrue{G_true}.csv")
 
 
 def load_completed_seeds(path):
