@@ -45,7 +45,7 @@ import time
 
 from mfg import MFG, MFG_config
 from utility import make_example
-from solver import MajorAgentEstimator
+from solver import MajorAgentEstimator, UObservedEstimator
 
 # --- baseline config (paper Section 6 / Fig B.5-B.6 regime) -----------------
 A = 5
@@ -56,7 +56,7 @@ N_BASE   = 256
 
 N_SEEDS         = 50
 N_EM_ITERS      = 200
-N_INNER_E_STEPS = 5
+N_INNER_E_STEPS = 10
 N_INNER_M_STEPS = 5
 LAM_ENTROPY     = 110.0   # normalized entropy penalty; validated good at N=256
 
@@ -109,6 +109,10 @@ def result_path(stage_idx, stage_name, G_true):
     return f"results_stage{stage_idx}_{stage_name}_Gtrue{G_true}.csv"
 
 
+def result_path_u(stage_idx, stage_name, G_true):
+    return f"results_u_stage{stage_idx}_{stage_name}_Gtrue{G_true}.csv"
+
+
 def load_completed_seeds(path):
     if not os.path.exists(path):
         return set()
@@ -152,7 +156,64 @@ def run_config(config_id, n_seeds=N_SEEDS):
             t0 = time.time()
             X, x_bar_obs, true_idx,_ = make_example(mfg, N_BASE, seed=seed)
             est = MajorAgentEstimator(mfg, unknown=unknown, lam_entropy=LAM_ENTROPY,
-                                       lr_E=0.05, lr_M=0.05)
+                                       lr_E=0.05, lr_M=0.05,lr_decay=0.97)
+            prob, fitted, n_steps = est.fit(
+                X, true_major_idx=true_idx, n_em_iters=N_EM_ITERS,
+                n_inner_E_steps=N_INNER_E_STEPS, n_inner_M_steps=N_INNER_M_STEPS,
+                verbose=False,
+            )
+            pred_idx = int(prob.argmax().item())
+            row = {
+                'seed': seed, 'config_id': config_id, 'stage': stage_idx,
+                'unknown_params': "|".join(unknown), 'G_true': G_true,
+                'predicted_idx': pred_idx, 'true_idx': true_idx,
+                'correct': int(pred_idx == true_idx), 'n_steps': n_steps,
+                'wall_time_sec': round(time.time() - t0, 2),
+            }
+            for p in unknown:
+                row[f"{p}_true"] = true_values[p]
+                row[f"{p}_fit"] = fitted[p]
+
+            writer.writerow(row)
+            f.flush(); os.fsync(f.fileno())   # survive a hard kill, not just clean exit
+
+            print(f"  seed={seed:3d}  correct={bool(row['correct'])}  "
+                  f"steps={n_steps:4d}  time={row['wall_time_sec']:.1f}s  "
+                  + "  ".join(f"{p}={fitted[p]:.3f}" for p in unknown), flush=True)
+
+    print(f"  config {config_id} done: {path}\n", flush=True)
+
+
+def run_config_u(config_id, n_seeds=N_SEEDS):
+    """Same as run_config, but with the control u observed (UObservedEstimator)
+    -- identical hyperparameters (lam_entropy, lr_E, lr_M, n_em_iters,
+    n_inner_E_steps, n_inner_M_steps) to run_config, so the two are an
+    apples-to-apples comparison of the X-only vs. u-observed regimes."""
+    config_id, stage_idx, stage_name, unknown, G_true = config_lookup(config_id)
+    path = result_path_u(stage_idx, stage_name, G_true)
+    done = load_completed_seeds(path)
+    fieldnames = fieldnames_for(unknown)
+    write_header = not os.path.exists(path)
+
+    mfg = make_mfg(G_true)
+    true_values = true_values_for(G_true)
+    print(f"=== Config {config_id} (u observed): stage {stage_idx} ({stage_name}), "
+          f"G_true={G_true}, unknown={unknown} ===", flush=True)
+    print(f"  results -> {path}   ({len(done)}/{n_seeds} already done)", flush=True)
+
+    with open(path, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+            f.flush(); os.fsync(f.fileno())
+
+        for seed in range(n_seeds):
+            if seed in done:
+                continue
+            t0 = time.time()
+            X, x_bar_obs, true_idx, u = make_example(mfg, N_BASE, seed=seed)
+            est = UObservedEstimator(mfg, unknown=unknown, lam_entropy=LAM_ENTROPY,
+                                      lr_E=0.05, lr_M=0.05, u=u,lr_decay=0.97)
             prob, fitted, n_steps = est.fit(
                 X, true_major_idx=true_idx, n_em_iters=N_EM_ITERS,
                 n_inner_E_steps=N_INNER_E_STEPS, n_inner_M_steps=N_INNER_M_STEPS,
@@ -188,9 +249,16 @@ def main():
                          help="1-20: (stage-1)*5 + g_index + 1, G_true as inner loop "
                               "over [0.1,0.3,0.5,0.7,0.9]. See CONFIGS for the full table.")
     parser.add_argument('--n-seeds', type=int, default=N_SEEDS)
+    parser.add_argument('--method', choices=['x', 'u'], default='x',
+                         help="'x': states only (MajorAgentEstimator, default). "
+                              "'u': control also observed (UObservedEstimator), "
+                              "same hyperparameters, writes to a results_u_*.csv.")
     args = parser.parse_args()
 
-    run_config(args.config_id, n_seeds=args.n_seeds)
+    if args.method == 'u':
+        run_config_u(args.config_id, n_seeds=args.n_seeds)
+    else:
+        run_config(args.config_id, n_seeds=args.n_seeds)
 
 
 if __name__ == "__main__":
