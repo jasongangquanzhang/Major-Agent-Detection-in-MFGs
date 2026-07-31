@@ -64,11 +64,13 @@ G_TRUE_VALUES = [0.1, 0.3, 0.5, 0.7, 0.9]
 
 STAGES = [
     (1, "G",               ['G']),
-    (2, "G_a_a0",           ['G', 'a', 'a_0']),
-    (3, "G_a_a0_q_q0",      ['G', 'a', 'a_0', 'q', 'q_0']),
-    (4, "G_a_a0_q_q0_c_c0", ['G', 'a', 'a_0', 'q', 'q_0', 'c', 'c_0']),
-    (5, "G_a",              ['G', 'a']),
-    (6, "G_a_q",            ['G', 'a','q']),
+    (2, "G_a",              ['G', 'a']),
+    (3, "G_a_q",            ['G', 'a','q']),
+    (4, "G_a_q_c",           ['G', 'a','q','c']),
+    (5, "G_a_a0",           ['G', 'a', 'a_0']),
+    (6, "G_a_a0_q_q0",      ['G', 'a', 'a_0', 'q', 'q_0']),
+    (7, "G_a_a0_q_q0_c_c0", ['G', 'a', 'a_0', 'q', 'q_0', 'c', 'c_0']),
+    
 ]
 
 # cross product: (config_id, stage_idx, stage_name, unknown, G_true),
@@ -106,11 +108,11 @@ def make_mfg(G_true):
 
 
 def result_path(stage_idx, stage_name, G_true):
-    return f"results_stage{stage_idx}_{stage_name}_Gtrue{G_true}.csv"
+    return f"result_7_31/results_stage{stage_idx}_{stage_name}_Gtrue{G_true}.csv"
 
 
 def result_path_u(stage_idx, stage_name, G_true):
-    return f"results_u_stage{stage_idx}_{stage_name}_Gtrue{G_true}.csv"
+    return f"result_7_31/results_u_stage{stage_idx}_{stage_name}_Gtrue{G_true}.csv"
 
 
 def load_completed_seeds(path):
