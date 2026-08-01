@@ -43,9 +43,11 @@ import csv
 import os
 import time
 
+import numpy as np
+
 from mfg import MFG, MFG_config
 from utility import make_example
-from solver import MajorAgentEstimator, UObservedEstimator
+from solver import MajorAgentEstimator, UObservedEstimator, UBarObservedEstimator
 
 # --- baseline config (paper Section 6 / Fig B.5-B.6 regime) -----------------
 A = 5
@@ -120,6 +122,10 @@ def result_path(stage_idx, stage_name, G_true):
 
 def result_path_u(stage_idx, stage_name, G_true):
     return _ensure_parent_dir(f"result_7_31/results_u_stage{stage_idx}_{stage_name}_Gtrue{G_true}.csv")
+
+
+def result_path_u_bar(stage_idx, stage_name, G_true):
+    return _ensure_parent_dir(f"result_7_31/results_u_bar_stage{stage_idx}_{stage_name}_Gtrue{G_true}.csv")
 
 
 def load_completed_seeds(path):
@@ -250,6 +256,71 @@ def run_config_u(config_id, n_seeds=N_SEEDS):
     print(f"  config {config_id} done: {path}\n", flush=True)
 
 
+def run_config_u_bar(config_id, n_seeds=N_SEEDS):
+    """Same as run_config, but with only the AGGREGATE minor-bank control
+    u_bar observed (UBarObservedEstimator) -- identical hyperparameters
+    (lam_entropy, lr_E, lr_M, n_em_iters, n_inner_E_steps, n_inner_M_steps)
+    to run_config/run_config_u, so all three are an apples-to-apples
+    comparison of the X-only vs. per-agent-u vs. aggregate-u_bar regimes.
+    u_bar is derived from make_example's per-agent u (mean over every row
+    except the known major row) rather than a dedicated data-generation
+    helper -- same underlying simulated path as run_config_u for a given
+    seed, just aggregated down to what UBarObservedEstimator actually needs."""
+    config_id, stage_idx, stage_name, unknown, G_true = config_lookup(config_id)
+    path = result_path_u_bar(stage_idx, stage_name, G_true)
+    done = load_completed_seeds(path)
+    fieldnames = fieldnames_for(unknown)
+    write_header = not os.path.exists(path)
+
+    mfg = make_mfg(G_true)
+    true_values = true_values_for(G_true)
+    print(f"=== Config {config_id} (u_bar observed): stage {stage_idx} ({stage_name}), "
+          f"G_true={G_true}, unknown={unknown} ===", flush=True)
+    print(f"  results -> {path}   ({len(done)}/{n_seeds} already done)", flush=True)
+
+    with open(path, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+            f.flush(); os.fsync(f.fileno())
+
+        for seed in range(n_seeds):
+            if seed in done:
+                continue
+            t0 = time.time()
+            X, x_bar_obs, true_idx, u = make_example(mfg, N_BASE, seed=seed)
+            minor_mask = np.ones(u.shape[0], dtype=bool)
+            minor_mask[true_idx] = False
+            u_bar = u[minor_mask].mean(axis=0)   # eq 3.4: aggregate minor-only control
+            est = UBarObservedEstimator(mfg, unknown=unknown, lam_entropy=LAM_ENTROPY,
+                                         lr_E=0.05, lr_M=0.05, u_bar=u_bar, lr_decay=0.97)
+            prob, fitted, n_steps = est.fit(
+                X, true_major_idx=true_idx, n_em_iters=N_EM_ITERS,
+                n_inner_E_steps=N_INNER_E_STEPS, n_inner_M_steps=N_INNER_M_STEPS,
+                verbose=False,
+            )
+            pred_idx = int(prob.argmax().item())
+            row = {
+                'seed': seed, 'config_id': config_id, 'stage': stage_idx,
+                'unknown_params': "|".join(unknown), 'G_true': G_true,
+                'predicted_idx': pred_idx, 'true_idx': true_idx,
+                'correct': int(pred_idx == true_idx), 'n_steps': n_steps,
+                'wall_time_sec': round(time.time() - t0, 2),
+            }
+            for p in unknown:
+                row[f"{p}_true"] = true_values[p]
+                row[f"{p}_fit"] = fitted[p]
+
+            writer.writerow(row)
+            f.flush(); os.fsync(f.fileno())   # survive a hard kill, not just clean exit
+
+            print(f"  seed={seed:3d}  correct={bool(row['correct'])}  "
+                  f"steps={n_steps:4d}  time={row['wall_time_sec']:.1f}s  "
+                  + "  ".join(f"{p}={fitted[p]:.3f}" for p in unknown), flush=True)
+
+    print(f"  config {config_id} done: {path}\n", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -258,14 +329,19 @@ def main():
                          help="1-20: (stage-1)*5 + g_index + 1, G_true as inner loop "
                               "over [0.1,0.3,0.5,0.7,0.9]. See CONFIGS for the full table.")
     parser.add_argument('--n-seeds', type=int, default=N_SEEDS)
-    parser.add_argument('--method', choices=['x', 'u'], default='x',
+    parser.add_argument('--method', choices=['x', 'u', 'ubar'], default='x',
                          help="'x': states only (MajorAgentEstimator, default). "
-                              "'u': control also observed (UObservedEstimator), "
-                              "same hyperparameters, writes to a results_u_*.csv.")
+                              "'u': per-agent control also observed (UObservedEstimator), "
+                              "writes to results_u_*.csv. 'ubar': only the AGGREGATE "
+                              "minor-bank control observed (UBarObservedEstimator), "
+                              "writes to results_u_bar_*.csv. All three share the same "
+                              "hyperparameters for an apples-to-apples comparison.")
     args = parser.parse_args()
 
     if args.method == 'u':
         run_config_u(args.config_id, n_seeds=args.n_seeds)
+    elif args.method == 'ubar':
+        run_config_u_bar(args.config_id, n_seeds=args.n_seeds)
     else:
         run_config(args.config_id, n_seeds=args.n_seeds)
 
