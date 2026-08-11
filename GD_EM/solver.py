@@ -781,19 +781,27 @@ class UBarObservedEstimator(MajorAgentEstimator):
     as well as full per-agent u observation, just with population-averaging
     noise instead of per-agent noise. See _ubar_residual/_loglik_ubar.
 
-    (3) MEAN-FIELD reconstruction: overrides _xbar_signals to reconstruct
-    xbar_t via the paper's eq (3.9), FORWARD-DRIVEN BY THE OBSERVED u_bar_t
-    itself, rather than eq (4.5)'s fully model-implied version (which
-    substitutes the model's own (q-phi_t)*(...) guess for the control).
-    Eq (3.9) needs only 'a' among the unknown minor params -- not 'q' and
-    not a Riccati solve at all -- so it's structurally less error-prone
-    during early EM than eq (4.5), which needs BOTH 'a' AND 'q' (and a
-    correctly-solved phi_t) to be right. The two are mathematically
-    identical at the true optimal params (eq 4.5 IS eq 3.9 after
-    substituting the optimal control law in); the choice only matters
-    transiently, while parameters are still converging -- but that's
-    precisely when the M-step gradient quality matters most. See
-    _ubar_driven_xbar.
+    (3) MEAN-FIELD reconstruction: deliberately does NOT override
+    _xbar_signals -- xbar_control still comes entirely from the base class's
+    eq (4.5) self-consistent solve, exactly as in MajorAgentEstimator. An
+    earlier version drove xbar_control off the paper's eq (3.9) instead,
+    forward-integrated from the OBSERVED u_bar_t itself, on the theory that
+    eq (3.9) needs only 'a' among the unknown minor params (not 'q' or a
+    Riccati solve), so it'd be more robust while q is still converging.
+    That's true in principle, but eq (3.9) driven by u_bar_t^obs bakes in a
+    PERMANENT noise floor that eq (4.5) doesn't have: u_bar_t^obs =
+    (q-phi_t)*(m_t - xbar_t^(N)), where xbar_t^(N) is the finite-N EMPIRICAL
+    mean of the one simulated population -- it differs from the true
+    mean-field LIMIT xbar_t by a fixed sampling-noise term (set by N and
+    sigma) that does NOT shrink as parameters converge, unlike eq (4.5)'s
+    error (which is purely a function of the current parameter estimates and
+    -> 0 as they approach truth). Feeding that noise into xbar_control (which
+    Theorem 4.1 says should be noise-free) measurably hurt 'a' and 'G'
+    recovery in the G,a stage (~3-7x worse RMSE than X-only -- see
+    conversation) -- worse than just leaving xbar_control alone. u_bar_t's
+    only remaining job is the _extra_M_term residual below, which compares
+    it against a PREDICTION rather than substituting it into the
+    reconstruction, so it can't inject that same floor into Lmaj/Lmin.
 
     Like XBarObservedEstimator, the u_bar residual is W-INDEPENDENT (one
     scalar-per-timestep constraint, not per-agent), so it can't be expressed
@@ -820,37 +828,6 @@ class UBarObservedEstimator(MajorAgentEstimator):
     def _ubar_sigma_eff(self):
         beta = self._meanfield_beta
         return self.ubar_sigma_loose * (1 - beta) + self.ubar_sigma * beta
-
-    def _ubar_driven_xbar(self, p, x0_hat, xbar0, dt):
-        """
-        Differentiable forward-Euler solve of eq (3.9), driven by the
-        OBSERVED aggregate control u_bar_t (contrast _meanfield_xbar, which
-        solves eq (4.5) using the model's OWN (q-phi_t)*(...) control-law
-        guess instead of real data). x0_hat: (Ndt,) aligned to xt. Returns
-        (Ndt,) xbar aligned to xt (xbar[0] == xbar0).
-        """
-        Ndt = x0_hat.shape[0]
-        F = 1 - p['G']
-        u_bar = self.u_bar[1:]
-        xbar = [None] * Ndt
-        xbar[0] = xbar0
-        for k in range(Ndt - 1):
-            xbar[k + 1] = xbar[k] + (p['a'] * (F - 1) * xbar[k] + p['a'] * p['G'] * x0_hat[k] + u_bar[k]) * dt
-        return torch.stack(xbar)
-
-    def _xbar_signals(self, p, phi_minor, x0_hat, xbar_emp, dt):
-        """
-        Same confidence-ramped blend as the base class, but toward the
-        u_bar-driven eq (3.9) reconstruction instead of eq (4.5)'s -- see
-        class docstring. Still gated by self._meanfield_beta since early-EM
-        'a' guesses (the only param this needs) are unreliable too.
-        """
-        beta = self._meanfield_beta
-        if beta <= 0.0:
-            return xbar_emp, xbar_emp
-        xbar_u = self._ubar_driven_xbar(p, x0_hat, xbar_emp[0], dt)
-        xbar_control = beta * xbar_u + (1 - beta) * xbar_emp if beta < 1.0 else xbar_u
-        return xbar_emp, xbar_control
 
     def _ubar_residual(self, p, phi_minor, xbar_control, x0_hat, dt):
         """
