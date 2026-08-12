@@ -49,7 +49,7 @@ CONFIG_LABELS = {
 }
 METHOD_FILE_PREFIX = {
     'x':     'results_stage',       # states only
-    'u_bar': 'results_u_bar_stage', # aggregate minor control observed
+    'u_bar': 'result_new_ubar/results_u_bar_stage', # aggregate minor control observed
     'u':     'results_u_stage',     # per-agent control observed
 }
 METHOD_COLORS = {

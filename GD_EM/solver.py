@@ -362,7 +362,7 @@ class MajorAgentEstimator:
         mu = xt + (drift + ctrl) * dt
         return dist.Normal(mu, sig_m).log_prob(xtp1).sum(dim=1)
 
-    def _extra_M_term(self, p, phi_minor, phi_major, xbar_control, x0_hat, dt):
+    def _extra_M_term(self, p, phi_minor, phi_major, xbar_drift, xbar_control, x0_hat, dt):
         # Additional term for the major bank's contribution to the log-likelihood.
         # This is a placeholder for any additional terms that might be needed.
         return 0.0
@@ -458,7 +458,7 @@ class MajorAgentEstimator:
                     J = (w_frozen * Lmaj + (1 - w_frozen) * Lmin).sum()
                     # w-independent, M-step-only extra term -- see
                     # _extra_M_term docstring. No-op in the base class.
-                    J = J + self._extra_M_term(p, phi_minor, phi_major, xbar_ctrl_M, x0_hat_frozen, dt)
+                    J = J + self._extra_M_term(p, phi_minor, phi_major, xbar_emp_frozen, xbar_ctrl_M, x0_hat_frozen, dt)
                     loss = -J
                     opt_M.zero_grad(); loss.backward()
                     gnorm = torch.nn.utils.clip_grad_norm_(list(self.raw.values()), max_norm=5.0)
@@ -748,11 +748,12 @@ class XBarObservedEstimator(MajorAgentEstimator):
         resid = self._meanfield_residual(p, phi_minor, x0_hat, dt)
         return dist.Normal(0.0, self.ode_sigma).log_prob(resid).sum()
 
-    def _extra_M_term(self, p, phi_minor, phi_major, xbar_control, x0_hat, dt):
+    def _extra_M_term(self, p, phi_minor, phi_major, xbar_drift, xbar_control, x0_hat, dt):
         # observed_xbar is guaranteed set by __init__ -- unconditional call,
         # nothing to gate. w is frozen throughout the M-step, so this can't
         # "cheat" by moving w to compensate for wrong params; it can only
         # push a/q/G toward satisfying the exact eq (4.5) constraint.
+        # xbar_drift unused here -- eq (4.5)'s own residual only needs xbar_control.
         return self._loglik_meanfield_ode(p, phi_minor, x0_hat, dt)
 
 
@@ -829,30 +830,45 @@ class UBarObservedEstimator(MajorAgentEstimator):
         beta = self._meanfield_beta
         return self.ubar_sigma_loose * (1 - beta) + self.ubar_sigma * beta
 
-    def _ubar_residual(self, p, phi_minor, xbar_control, x0_hat, dt):
+    def _ubar_residual(self, p, phi_minor, xbar_drift, xbar_control, x0_hat, dt):
         """
         u_bar_t^obs vs. the model-predicted aggregate minor control law
-        (mean of eq 4.3 over i): u_bar_t = (q-phi_t)*[(F-1)*xbar_t+G*x0_t].
-        Unlike _meanfield_residual (an xbar-INCREMENT residual), this
-        compares observed u_bar directly against its own noise-free
-        prediction -- one independent residual per timestep, no
-        time-integration to compound error. phi_minor, xbar_control, x0_hat:
-        (Ndt,) aligned to xt. Returns (Ndt,) residuals.
+        (mean of eq 4.3 over i): averaging u_i,t*=(q-phi_t)*(m_t - x_i,t) over
+        the N minor agents gives u_bar_t=(q-phi_t)*(m_t - xbar_t^(N)), where
+        m_t=(1-G)*xbar_t+G*x0_t is the market state (mean-field limit, i.e.
+        xbar_control) but the SUBTRACTED term is the finite-N EMPIRICAL mean
+        of the minors, xbar_drift -- NOT xbar_control. Getting this right
+        matters: xbar_drift is exact (directly computable from the observed
+        X, no approximation), whereas xbar_control is only an approximation
+        of the mean-field limit. self.u_bar was itself generated from the
+        SAME finite-N realization xbar_drift measures, so using xbar_drift
+        here makes the residual's only source of error genuinely be
+        parameter mis-estimation -- using xbar_control instead (an earlier
+        bug) bakes in a spurious, permanent finite-N sampling-noise gap that
+        no amount of EM convergence removes, which was swamping the true
+        parameter-estimation signal (see conversation: a 256-agent x 512-step
+        base likelihood was getting overpowered by this 512-term aggregate
+        term because the mismatch inflated its residual/sigma ratio well
+        past O(1)). Unlike _meanfield_residual (an xbar-INCREMENT residual),
+        this compares observed u_bar directly against its own prediction --
+        one independent residual per timestep, no time-integration to
+        compound error. phi_minor, xbar_drift, xbar_control, x0_hat: (Ndt,)
+        aligned to xt. Returns (Ndt,) residuals.
         """
-        F = 1 - p['G']
-        predicted = (p['q'] - phi_minor) * ((F - 1) * xbar_control + p['G'] * x0_hat)
+        market_control = (1 - p['G']) * xbar_control + p['G'] * x0_hat
+        predicted = (p['q'] - phi_minor) * (market_control - xbar_drift)
         actual = self.u_bar[1:]
         return actual - predicted
 
-    def _loglik_ubar(self, p, phi_minor, xbar_control, x0_hat, dt):
-        resid = self._ubar_residual(p, phi_minor, xbar_control, x0_hat, dt)
+    def _loglik_ubar(self, p, phi_minor, xbar_drift, xbar_control, x0_hat, dt):
+        resid = self._ubar_residual(p, phi_minor, xbar_drift, xbar_control, x0_hat, dt)
         return dist.Normal(0.0, self._ubar_sigma_eff()).log_prob(resid).sum()
 
-    def _extra_M_term(self, p, phi_minor, phi_major, xbar_control, x0_hat, dt):
+    def _extra_M_term(self, p, phi_minor, phi_major, xbar_drift, xbar_control, x0_hat, dt):
         # w is frozen throughout the M-step, so this can't "cheat" by moving
         # w to compensate for wrong params -- mirrors XBarObservedEstimator's
         # _extra_M_term / the observed_xbar M-step-only rationale.
-        return self._loglik_ubar(p, phi_minor, xbar_control, x0_hat, dt)
+        return self._loglik_ubar(p, phi_minor, xbar_drift, xbar_control, x0_hat, dt)
 
 
 # ----------------------------------------------------------------------------
